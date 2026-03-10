@@ -1,0 +1,128 @@
+name: Build Installers
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install pyinstaller numpy scipy requests
+
+      - name: Build executable
+        run: |
+          pyinstaller --onefile --name whome --icon NONE --console ^
+            --hidden-import numpy ^
+            --hidden-import scipy ^
+            --hidden-import scipy.sparse ^
+            --hidden-import scipy.sparse.linalg ^
+            --add-data "w_operator.py;." ^
+            --add-data "w_cuda.py;." ^
+            client.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: whome-windows
+          path: dist/whome.exe
+
+  build-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install pyinstaller numpy scipy requests
+
+      - name: Build executable
+        run: |
+          pyinstaller --onefile --name whome --console \
+            --hidden-import numpy \
+            --hidden-import scipy \
+            --hidden-import scipy.sparse \
+            --hidden-import scipy.sparse.linalg \
+            --add-data "w_operator.py:." \
+            --add-data "w_cuda.py:." \
+            client.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: whome-linux
+          path: dist/whome
+
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install pyinstaller numpy scipy requests
+
+      - name: Build executable
+        run: |
+          pyinstaller --onefile --name whome --console \
+            --hidden-import numpy \
+            --hidden-import scipy \
+            --hidden-import scipy.sparse \
+            --hidden-import scipy.sparse.linalg \
+            --add-data "w_operator.py:." \
+            --add-data "w_cuda.py:." \
+            client.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: whome-macos
+          path: dist/whome
+
+  release:
+    needs: [build-windows, build-linux, build-macos]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+
+      - name: Rename binaries
+        run: |
+          mv whome-windows/whome.exe whome-windows.exe
+          mv whome-linux/whome whome-linux
+          chmod +x whome-linux
+          mv whome-macos/whome whome-macos
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            whome-windows.exe
+            whome-linux
+            whome-macos
+          body: |
+            ## W@Home Hive
+
+            Download the file for your platform, run it, done.
+
+            **Windows:** Download `whome-windows.exe`, double-click it.
+            **Mac:** Download `whome-macos`, open Terminal, run `chmod +x whome-macos && ./whome-macos`
+            **Linux:** Download `whome-linux`, run `chmod +x whome-linux && ./whome-linux`
+
+            First run will ask for your node name and server address.

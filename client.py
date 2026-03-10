@@ -326,12 +326,41 @@ def register(name, gpu_info):
     cfg['api_key'] = data['api_key']
     cfg['worker_id'] = data['worker_id']
     cfg['name'] = name
+    cfg['server'] = SERVER_URL
     save_config(cfg)
     return data['api_key'], data['worker_id']
 
 # ═══════════════════════════════════════════════════════════
 # Main loop
 # ═══════════════════════════════════════════════════════════
+
+def interactive_setup(cfg):
+    """First-run wizard when double-clicked without arguments."""
+    print("")
+    print("  \033[96m╔══════════════════════════════════════════════════════════╗")
+    print("  ║  \033[1mW@HOME HIVE\033[0m\033[96m — First-Time Setup                         ║")
+    print("  ╚══════════════════════════════════════════════════════════╝\033[0m")
+    print("")
+    print("  Welcome! Let's get you set up to contribute.\n")
+
+    # Name
+    import platform
+    default_name = f"{platform.node()}-{os.getenv('USER', os.getenv('USERNAME', 'worker'))}"
+    name = input(f"  Your node name [{default_name}]: ").strip()
+    if not name:
+        name = default_name
+    print(f"  \033[92m✓\033[0m Name: {name}\n")
+
+    # Server
+    default_server = cfg.get('server', "https://akataleptos.com/hive")
+    server = input(f"  Hive server [{default_server}]: ").strip()
+    if not server:
+        server = default_server
+    print(f"  \033[92m✓\033[0m Server: {server}\n")
+
+    cfg['name'] = name
+    cfg['server'] = server
+    return name, server
 
 def main():
     parser = argparse.ArgumentParser(description="W@Home Hive Worker")
@@ -343,8 +372,17 @@ def main():
     args = parser.parse_args()
 
     global SERVER_URL
-    if args.server:
+    cfg = load_config()
+
+    # Interactive first-run wizard if no config exists and no CLI args
+    if not cfg.get('api_key') and not args.key and not args.server and not args.name:
+        name, server = interactive_setup(cfg)
+        args.name = name
+        SERVER_URL = server
+    elif args.server:
         SERVER_URL = args.server
+    elif cfg.get('server'):
+        SERVER_URL = cfg['server']
 
     # Set nice priority
     try:
@@ -355,7 +393,6 @@ def main():
     display = Display()
 
     # Get or create API key
-    cfg = load_config()
     api_key = args.key or cfg.get('api_key')
 
     if not api_key:
@@ -504,4 +541,12 @@ def main():
     display.show_info("Worker stopped. Progress saved. Run again to resume.")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print(f"\n  \033[91mError: {e}\033[0m")
+        print("  If this keeps happening, check your internet connection")
+        print("  or contact the Hive admin.\n")
+        # Keep window open on crash so user can read the error
+        if getattr(sys, 'frozen', False):  # PyInstaller exe
+            input("  Press Enter to exit...")
