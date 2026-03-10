@@ -8,6 +8,8 @@
 <link rel="manifest" href="/manifest.json">
 <meta name="theme-color" content="#0a0a10">
 <meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="apple-touch-icon" href="/static/icon-192.png">
 <style>
   :root {
     --bg: #0a0a10; --bg2: #12121e; --bg3: #1a1a2e;
@@ -201,6 +203,46 @@
   }
   .pause-btn:hover { border-color: var(--cyan); }
 
+  /* Loading overlay */
+  #loading-overlay {
+    position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+    z-index: 100; background: var(--bg);
+    display: none; flex-direction: column;
+    align-items: center; justify-content: center; gap: 1.5em;
+    padding: 2em; text-align: center;
+  }
+  #loading-overlay.active { display: flex; }
+  #loading-overlay h2 { color: var(--cyan); font-size: 1.3em; }
+  #loading-overlay .sub { color: var(--dim); font-size: 0.85em; max-width: 320px; line-height: 1.6; }
+  .progress-bar {
+    width: 280px; height: 6px; background: var(--border); border-radius: 3px; overflow: hidden;
+  }
+  .progress-fill {
+    height: 100%; width: 0%; background: linear-gradient(90deg, var(--cyan), var(--violet));
+    border-radius: 3px; transition: width 0.3s ease;
+  }
+  #loading-status { color: var(--text); font-size: 0.8em; }
+  #loading-size { color: var(--dim); font-size: 0.75em; }
+
+  /* Install banner */
+  #install-banner {
+    position: fixed; bottom: 0; left: 0; right: 0;
+    background: rgba(18, 18, 30, 0.95); border-top: 1px solid var(--cyan);
+    padding: 1em 1.5em; display: none; align-items: center;
+    justify-content: space-between; z-index: 50; backdrop-filter: blur(10px);
+  }
+  #install-banner.show { display: flex; }
+  #install-banner span { color: var(--text); font-size: 0.85em; }
+  #install-banner button {
+    background: var(--cyan); color: var(--bg); border: none;
+    padding: 0.5em 1.2em; border-radius: 4px; font-family: inherit;
+    font-weight: bold; cursor: pointer; font-size: 0.85em;
+  }
+  #install-dismiss {
+    background: transparent !important; color: var(--dim) !important;
+    font-weight: normal !important; margin-left: 0.5em;
+  }
+
   /* Mobile */
   @media (max-width: 600px) {
     .wizard { padding: 1.5em; }
@@ -210,6 +252,25 @@
 </style>
 </head>
 <body>
+
+<!-- Loading overlay -->
+<div id="loading-overlay">
+  <div class="loader" style="width:40px;height:40px;border-width:3px;"></div>
+  <h2>Setting up your compute node</h2>
+  <div class="progress-bar"><div class="progress-fill" id="load-progress"></div></div>
+  <div id="loading-status">Loading Python runtime...</div>
+  <div id="loading-size"></div>
+  <div class="sub">First time takes 30-60 seconds to download the math libraries. After that it's cached and loads instantly.</div>
+</div>
+
+<!-- Install banner -->
+<div id="install-banner">
+  <span>Add W@Home to your home screen for easy access</span>
+  <div>
+    <button id="install-btn" onclick="installApp()">Install</button>
+    <button id="install-dismiss" onclick="dismissInstall()">Not now</button>
+  </div>
+</div>
 
 <canvas id="bg-canvas"></canvas>
 
@@ -505,9 +566,21 @@ function setStage(n) {
   }
 }
 
+function showLoading(show) {
+  const el = document.getElementById('loading-overlay');
+  if (show) el.classList.add('active');
+  else el.classList.remove('active');
+}
+
+function loadProgress(pct, status, size) {
+  document.getElementById('load-progress').style.width = pct + '%';
+  if (status) document.getElementById('loading-status').textContent = status;
+  if (size) document.getElementById('loading-size').textContent = size;
+}
+
 async function startCompute() {
   const btn = document.getElementById('start-btn');
-  btn.innerHTML = '<span class="loader"></span>Loading Pyodide...';
+  btn.innerHTML = '<span class="loader"></span>Initializing...';
   btn.disabled = true;
 
   // Check for existing session
@@ -515,15 +588,16 @@ async function startCompute() {
     await registerWorker();
   }
 
-  // Switch to compute view
+  // Switch to compute view with loading overlay
   document.getElementById('wizard-view').style.display = 'none';
   document.getElementById('compute-view').classList.add('active');
+  showLoading(true);
 
   log('Registered as ' + workerId, 'info');
-  log('Loading Python runtime (first time takes ~20s)...', 'info');
 
-  // Load Pyodide
   try {
+    // Step 1: Load Pyodide script
+    loadProgress(10, 'Downloading Python runtime...', '~5 MB');
     const script = document.createElement('script');
     script.src = 'https://cdn.jsdelivr.net/pyodide/v0.25.1/full/pyodide.js';
     document.head.appendChild(script);
@@ -532,21 +606,34 @@ async function startCompute() {
       script.onerror = reject;
     });
 
-    log('Pyodide loaded. Installing numpy + scipy...', 'info');
+    // Step 2: Initialize Pyodide
+    loadProgress(30, 'Initializing Python...', '');
+    log('Loading Python runtime...', 'info');
     const pyodide = await loadPyodide();
-    await pyodide.loadPackage(['numpy', 'scipy']);
-    log('Runtime ready. Fetching compute kernel...', 'ok');
 
-    // Fetch w_operator.py from server
+    // Step 3: Install numpy + scipy (the big ones)
+    loadProgress(50, 'Installing numpy + scipy...', '~15 MB (cached after first load)');
+    log('Installing math libraries...', 'info');
+    await pyodide.loadPackage(['numpy', 'scipy']);
+
+    // Step 4: Load compute kernel
+    loadProgress(90, 'Loading compute kernel...', '');
+    log('Runtime ready. Fetching compute kernel...', 'ok');
     const wopResp = await fetch(API + '/static/w_operator.py');
     const wopCode = await wopResp.text();
     pyodide.runPython(wopCode);
+
+    // Done loading
+    loadProgress(100, 'Ready!', '');
     log('Compute kernel loaded. Starting work loop...', 'ok');
+    await sleep(300);
+    showLoading(false);
 
     // Main compute loop
     computeLoop(pyodide);
 
   } catch(e) {
+    showLoading(false);
     log('Error loading runtime: ' + e.message, 'hit');
     document.getElementById('lambda-display').textContent = 'Load failed — try refreshing';
   }
@@ -728,6 +815,40 @@ function togglePause() {
 }
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// ── Service Worker Registration ──
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('/sw.js')
+    .then(reg => console.log('SW registered, scope:', reg.scope))
+    .catch(err => console.log('SW registration failed:', err));
+}
+
+// ── PWA Install Prompt ──
+let deferredPrompt = null;
+
+window.addEventListener('beforeinstallprompt', (e) => {
+  e.preventDefault();
+  deferredPrompt = e;
+  // Show install banner if user hasn't dismissed it
+  if (!localStorage.getItem('whome_install_dismissed')) {
+    document.getElementById('install-banner').classList.add('show');
+  }
+});
+
+function installApp() {
+  if (deferredPrompt) {
+    deferredPrompt.prompt();
+    deferredPrompt.userChoice.then(result => {
+      deferredPrompt = null;
+      document.getElementById('install-banner').classList.remove('show');
+    });
+  }
+}
+
+function dismissInstall() {
+  document.getElementById('install-banner').classList.remove('show');
+  localStorage.setItem('whome_install_dismissed', '1');
+}
 
 // ── Auto-resume if returning user ──
 if (loadLocal()) {

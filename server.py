@@ -28,6 +28,7 @@ import time
 import secrets
 import os
 import numpy as np
+import threading
 
 # ═══════════════════════════════════════════════════════════
 # Configuration
@@ -414,21 +415,45 @@ def compute_page():
 def serve_static(filename: str):
     safe = filename.replace("..", "").replace("/", "")
     path = os.path.join(HIVE_DIR, safe)
-    if os.path.exists(path):
-        return FileResponse(path, media_type="text/plain")
-    raise HTTPException(404, "File not found")
+    if not os.path.exists(path):
+        raise HTTPException(404, "File not found")
+    ext = os.path.splitext(safe)[1].lower()
+    mtype = {'.py': 'text/plain', '.js': 'application/javascript', '.html': 'text/html',
+             '.png': 'image/png', '.json': 'application/json', '.css': 'text/css'}.get(ext, 'application/octet-stream')
+    return FileResponse(path, media_type=mtype)
+
+@app.get("/sw.js")
+def service_worker():
+    sw_path = os.path.join(HIVE_DIR, "sw.js")
+    return FileResponse(sw_path, media_type="application/javascript",
+                        headers={"Service-Worker-Allowed": "/", "Cache-Control": "no-cache"})
 
 @app.get("/manifest.json")
 def pwa_manifest():
     return {
         "name": "W@Home Hive",
         "short_name": "W@Home",
-        "description": "Distributed spectral search for physical constants",
+        "description": "Distributed spectral search for physical constants in the Menger sponge eigenvalue spectra",
         "start_url": "/compute",
         "display": "standalone",
         "background_color": "#0a0a10",
         "theme_color": "#a0f0ff",
+        "orientation": "any",
+        "categories": ["science", "education"],
+        "icons": [
+            {"src": "/static/icon-192.png", "sizes": "192x192", "type": "image/png"},
+            {"src": "/static/icon-512.png", "sizes": "512x512", "type": "image/png"},
+        ],
     }
+
+def _background_canary_setup():
+    """Generate canaries in background so server starts immediately."""
+    try:
+        canaries = generate_canaries(50)
+        seed_canaries(canaries)
+        print(f"[Hive] Canary system ready — {len(canaries)} canaries")
+    except Exception as e:
+        print(f"[Hive] Canary generation failed: {e}")
 
 @app.on_event("startup")
 async def startup():
@@ -436,10 +461,9 @@ async def startup():
     init_db()
     print("[Hive] Seeding jobs...")
     seed_jobs()
-    print("[Hive] Setting up canary system...")
-    canaries = generate_canaries(50)
-    seed_canaries(canaries)
-    print(f"[Hive] Online — {TOTAL_JOBS:,} jobs + {len(canaries)} canaries")
+    print("[Hive] Starting canary generation in background...")
+    threading.Thread(target=_background_canary_setup, daemon=True).start()
+    print(f"[Hive] Online — {TOTAL_JOBS:,} jobs")
     print(f"[Hive] Secret: {SERVER_SECRET[:8]}...")
 
 # ── Registration ──
