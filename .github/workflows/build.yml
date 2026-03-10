@@ -19,15 +19,16 @@ jobs:
           pip install pyinstaller numpy scipy requests
 
       - name: Build executable
-        run: |
-          pyinstaller --onefile --name whome --icon NONE --console ^
-            --hidden-import numpy ^
-            --hidden-import scipy ^
-            --hidden-import scipy.sparse ^
-            --hidden-import scipy.sparse.linalg ^
-            --add-data "w_operator.py;." ^
-            --add-data "w_cuda.py;." ^
-            client.py
+        shell: cmd
+        run: >
+          pyinstaller --onefile --name whome --icon NONE --console
+          --hidden-import numpy
+          --hidden-import scipy
+          --hidden-import scipy.sparse
+          --hidden-import scipy.sparse.linalg
+          --add-data "w_operator.py;."
+          --add-data "w_cuda.py;."
+          client.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
