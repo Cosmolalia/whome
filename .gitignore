@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+venv/
+hive.db
+worker_config.json
+checkpoint.json
+canaries.json
+discoveries.log
+*.egg-info/
+.env

@@ -1,0 +1,745 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>W@Home — Join the Search</title>
+<meta name="description" content="Donate your spare compute to search for physical constants in the eigenvalue spectra of the Menger sponge. Any device. Zero install.">
+<link rel="manifest" href="/manifest.json">
+<meta name="theme-color" content="#0a0a10">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<style>
+  :root {
+    --bg: #0a0a10; --bg2: #12121e; --bg3: #1a1a2e;
+    --cyan: #a0f0ff; --gold: #ffd06a; --violet: #c4a0ff;
+    --green: #80ffaa; --red: #ff6b6b; --text: #c8c8d8;
+    --dim: #555568; --border: #2a2a3a;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: 'SF Mono', 'JetBrains Mono', 'Fira Code', monospace;
+    min-height: 100vh; overflow-x: hidden;
+  }
+
+  /* Three.js canvas background */
+  #bg-canvas {
+    position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+    z-index: 0; opacity: 0.4;
+  }
+
+  /* Main overlay */
+  .overlay {
+    position: relative; z-index: 1; min-height: 100vh;
+    display: flex; align-items: center; justify-content: center;
+    padding: 2em;
+  }
+
+  /* Wizard container */
+  .wizard {
+    max-width: 520px; width: 100%;
+    background: rgba(18, 18, 30, 0.92);
+    border: 1px solid var(--border); border-radius: 12px;
+    padding: 2.5em; backdrop-filter: blur(10px);
+  }
+
+  /* Steps */
+  .step { display: none; }
+  .step.active { display: block; animation: fadeIn 0.4s ease; }
+  @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+
+  .wizard h1 {
+    color: var(--cyan); font-size: 1.6em; margin-bottom: 0.3em;
+    letter-spacing: 0.06em;
+  }
+  .wizard h2 {
+    color: var(--violet); font-size: 1.1em; margin-bottom: 1em;
+    font-weight: normal;
+  }
+  .wizard p { color: var(--dim); line-height: 1.7; margin-bottom: 1em; font-size: 0.9em; }
+  .wizard .highlight { color: var(--gold); }
+
+  /* Step indicators */
+  .steps-bar {
+    display: flex; gap: 8px; margin-bottom: 2em; justify-content: center;
+  }
+  .steps-bar .dot {
+    width: 10px; height: 10px; border-radius: 50%;
+    background: var(--border); transition: all 0.3s;
+  }
+  .steps-bar .dot.done { background: var(--green); }
+  .steps-bar .dot.current { background: var(--cyan); box-shadow: 0 0 8px var(--cyan); }
+
+  /* Inputs */
+  input[type="text"] {
+    width: 100%; background: var(--bg); border: 1px solid var(--border);
+    border-radius: 6px; padding: 0.8em 1em; color: var(--text);
+    font-family: inherit; font-size: 1em; outline: none;
+    transition: border-color 0.2s;
+  }
+  input[type="text"]:focus { border-color: var(--cyan); }
+  input[type="text"]::placeholder { color: var(--dim); }
+
+  /* Sliders */
+  .slider-group { margin: 1.5em 0; }
+  .slider-group label {
+    display: flex; justify-content: space-between; margin-bottom: 0.5em;
+    font-size: 0.85em;
+  }
+  .slider-group label span { color: var(--dim); }
+  .slider-group label .val { color: var(--cyan); }
+  input[type="range"] {
+    width: 100%; appearance: none; height: 4px;
+    background: var(--border); border-radius: 2px; outline: none;
+  }
+  input[type="range"]::-webkit-slider-thumb {
+    appearance: none; width: 16px; height: 16px; border-radius: 50%;
+    background: var(--cyan); cursor: pointer;
+  }
+
+  /* Toggles */
+  .toggle-row {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 0.7em 0; border-bottom: 1px solid var(--border);
+    font-size: 0.9em;
+  }
+  .toggle {
+    width: 44px; height: 24px; background: var(--border); border-radius: 12px;
+    position: relative; cursor: pointer; transition: background 0.2s;
+  }
+  .toggle.on { background: var(--cyan); }
+  .toggle::after {
+    content: ''; position: absolute; top: 3px; left: 3px;
+    width: 18px; height: 18px; border-radius: 50%;
+    background: white; transition: left 0.2s;
+  }
+  .toggle.on::after { left: 23px; }
+
+  /* Buttons */
+  .btn {
+    display: inline-block; padding: 0.8em 2em; border-radius: 6px;
+    font-family: inherit; font-size: 0.95em; cursor: pointer;
+    border: none; transition: all 0.2s; margin-top: 1.5em;
+  }
+  .btn-primary {
+    background: var(--cyan); color: var(--bg); font-weight: bold;
+  }
+  .btn-primary:hover { background: #c0f8ff; transform: translateY(-1px); }
+  .btn-secondary {
+    background: transparent; color: var(--dim); border: 1px solid var(--border);
+    margin-right: 1em;
+  }
+  .btn-secondary:hover { border-color: var(--dim); color: var(--text); }
+  .btn-row { display: flex; justify-content: flex-end; align-items: center; }
+
+  /* Loading */
+  .loader {
+    display: inline-block; width: 20px; height: 20px;
+    border: 2px solid var(--border); border-top-color: var(--cyan);
+    border-radius: 50%; animation: spin 0.8s linear infinite;
+    margin-right: 0.5em; vertical-align: middle;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* Computing view */
+  #compute-view {
+    position: relative; z-index: 1; min-height: 100vh;
+    display: none; padding: 1.5em;
+  }
+  #compute-view.active { display: block; }
+
+  .compute-header {
+    display: flex; justify-content: space-between; align-items: center;
+    padding-bottom: 1em; border-bottom: 1px solid var(--border);
+    margin-bottom: 1.5em;
+  }
+  .compute-header h1 { color: var(--cyan); font-size: 1.2em; }
+
+  .stats-grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 1em; margin-bottom: 1.5em;
+  }
+  .stat-card {
+    background: rgba(18, 18, 30, 0.9); border: 1px solid var(--border);
+    border-radius: 8px; padding: 1em; text-align: center;
+  }
+  .stat-card .num { font-size: 1.8em; color: var(--cyan); font-weight: bold; }
+  .stat-card .label { font-size: 0.75em; color: var(--dim); margin-top: 0.3em; }
+
+  .stage-dots {
+    display: flex; gap: 6px; align-items: center;
+    font-size: 0.85em; margin: 1em 0;
+  }
+  .stage-dots .dot {
+    width: 12px; height: 12px; border-radius: 50%;
+    background: var(--border); transition: all 0.3s;
+  }
+  .stage-dots .dot.done { background: var(--green); }
+  .stage-dots .dot.active { background: var(--cyan); box-shadow: 0 0 8px var(--cyan); animation: pulse 1.5s ease infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
+
+  .lambda-display {
+    font-size: 1.4em; color: var(--gold); text-align: center;
+    margin: 1em 0; padding: 0.8em;
+    background: rgba(18, 18, 30, 0.9); border: 1px solid var(--border);
+    border-radius: 8px;
+  }
+
+  .log-feed {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+    padding: 1em; max-height: 200px; overflow-y: auto; font-size: 0.8em;
+    color: var(--dim); line-height: 1.8;
+  }
+  .log-feed .hit { color: var(--gold); font-weight: bold; }
+  .log-feed .ok { color: var(--green); }
+  .log-feed .info { color: var(--cyan); }
+
+  .pause-btn {
+    background: var(--bg3); color: var(--text); border: 1px solid var(--border);
+    padding: 0.5em 1.5em; border-radius: 6px; cursor: pointer;
+    font-family: inherit; font-size: 0.85em;
+  }
+  .pause-btn:hover { border-color: var(--cyan); }
+
+  /* Mobile */
+  @media (max-width: 600px) {
+    .wizard { padding: 1.5em; }
+    .wizard h1 { font-size: 1.3em; }
+    .stats-grid { grid-template-columns: repeat(2, 1fr); }
+  }
+</style>
+</head>
+<body>
+
+<canvas id="bg-canvas"></canvas>
+
+<!-- ════════ WIZARD ════════ -->
+<div class="overlay" id="wizard-view">
+<div class="wizard">
+  <div class="steps-bar">
+    <div class="dot current" id="dot-0"></div>
+    <div class="dot" id="dot-1"></div>
+    <div class="dot" id="dot-2"></div>
+  </div>
+
+  <!-- Step 0: Welcome -->
+  <div class="step active" id="step-0">
+    <h1>W@HOME</h1>
+    <h2>Join the Search</h2>
+    <p>
+      We're searching for the fundamental constants of physics &mdash;
+      <span class="highlight">&pi;, e, &phi;, &alpha;</span> &mdash;
+      hidden in the eigenvalue spectra of the
+      <span class="highlight">Menger sponge</span>.
+    </p>
+    <p>
+      Your device donates spare compute cycles to sweep a critical
+      parameter range. Every eigenvalue ratio is checked against
+      known constants. One match changes everything.
+    </p>
+    <p>
+      <span class="highlight">Zero install.</span> Runs in your browser.
+      Works on phones, tablets, laptops &mdash; anything.
+    </p>
+    <div class="btn-row">
+      <button class="btn btn-primary" onclick="nextStep()">Join the Hive</button>
+    </div>
+  </div>
+
+  <!-- Step 1: Identity -->
+  <div class="step" id="step-1">
+    <h1>Name Your Node</h1>
+    <h2>How should we credit your contribution?</h2>
+    <input type="text" id="worker-name" placeholder="e.g. quantum-marmelade"
+           maxlength="40" autocomplete="off" spellcheck="false">
+    <p style="margin-top: 1em;">
+      This appears on the public leaderboard. You can change it later.
+    </p>
+    <div class="btn-row">
+      <button class="btn btn-secondary" onclick="prevStep()">Back</button>
+      <button class="btn btn-primary" onclick="nextStep()">Next</button>
+    </div>
+  </div>
+
+  <!-- Step 2: Configure -->
+  <div class="step" id="step-2">
+    <h1>Configure</h1>
+    <h2>How hard should we work?</h2>
+
+    <div class="slider-group">
+      <label><span>Compute Intensity</span><span class="val" id="intensity-val">Medium</span></label>
+      <input type="range" id="intensity" min="1" max="3" value="2"
+             oninput="updateIntensity(this.value)">
+    </div>
+
+    <div class="toggle-row">
+      <span>Only compute when charging</span>
+      <div class="toggle on" id="toggle-charging" onclick="toggleSwitch(this)"></div>
+    </div>
+    <div class="toggle-row">
+      <span>Pause on low battery (&lt;20%)</span>
+      <div class="toggle on" id="toggle-battery" onclick="toggleSwitch(this)"></div>
+    </div>
+    <div class="toggle-row">
+      <span>Run in background</span>
+      <div class="toggle on" id="toggle-background" onclick="toggleSwitch(this)"></div>
+    </div>
+
+    <div class="btn-row">
+      <button class="btn btn-secondary" onclick="prevStep()">Back</button>
+      <button class="btn btn-primary" id="start-btn" onclick="startCompute()">
+        Start Computing
+      </button>
+    </div>
+  </div>
+</div>
+</div>
+
+<!-- ════════ COMPUTING VIEW ════════ -->
+<div id="compute-view">
+  <div class="compute-header">
+    <h1>W@HOME HIVE</h1>
+    <button class="pause-btn" id="pause-btn" onclick="togglePause()">Pause</button>
+  </div>
+
+  <div class="lambda-display" id="lambda-display">
+    Initializing Pyodide...
+  </div>
+
+  <div class="stage-dots" id="stage-dots">
+    <div class="dot" id="sd-0"></div><span>Graph</span>
+    <div class="dot" id="sd-1"></div><span>Glue</span>
+    <div class="dot" id="sd-2"></div><span>Merge</span>
+    <div class="dot" id="sd-3"></div><span>Laplacian</span>
+    <div class="dot" id="sd-4"></div><span>Spectrum</span>
+  </div>
+
+  <div class="stats-grid">
+    <div class="stat-card">
+      <div class="num" id="s-jobs">0</div>
+      <div class="label">Jobs Completed</div>
+    </div>
+    <div class="stat-card">
+      <div class="num" id="s-workers">-</div>
+      <div class="label">Workers Online</div>
+    </div>
+    <div class="stat-card">
+      <div class="num" id="s-pct">0%</div>
+      <div class="label">Sweep Complete</div>
+    </div>
+    <div class="stat-card">
+      <div class="num" id="s-discoveries">0</div>
+      <div class="label">Discoveries</div>
+    </div>
+  </div>
+
+  <div class="log-feed" id="log-feed">
+    <div class="info">Waiting to start...</div>
+  </div>
+</div>
+
+<!-- ════════ THREE.JS BACKGROUND ════════ -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+// Menger sponge WebGL background
+(function() {
+  const canvas = document.getElementById('bg-canvas');
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(45, window.innerWidth/window.innerHeight, 0.1, 100);
+  camera.position.set(4, 3, 5);
+  camera.lookAt(0, 0, 0);
+
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setClearColor(0x000000, 0);
+
+  const material = new THREE.LineBasicMaterial({ color: 0xa0f0ff, transparent: true, opacity: 0.3 });
+  const goldMat = new THREE.LineBasicMaterial({ color: 0xffd06a, transparent: true, opacity: 0.25 });
+
+  function cubeEdges(cx, cy, cz, s) {
+    const h = s/2;
+    const c = [[cx-h,cy-h,cz-h],[cx-h,cy-h,cz+h],[cx-h,cy+h,cz-h],[cx-h,cy+h,cz+h],
+               [cx+h,cy-h,cz-h],[cx+h,cy-h,cz+h],[cx+h,cy+h,cz-h],[cx+h,cy+h,cz+h]];
+    const edges = [[0,1],[2,3],[4,5],[6,7],[0,2],[1,3],[4,6],[5,7],[0,4],[1,5],[2,6],[3,7]];
+    const pts = [];
+    edges.forEach(([a,b]) => { pts.push(new THREE.Vector3(...c[a]), new THREE.Vector3(...c[b])); });
+    return pts;
+  }
+
+  function mengerCubes(lv, cx, cy, cz, sz) {
+    if (lv === 0) return [[cx, cy, cz, sz]];
+    const out = [];
+    const s3 = sz/3;
+    for (let x = -1; x <= 1; x++)
+      for (let y = -1; y <= 1; y++)
+        for (let z = -1; z <= 1; z++) {
+          const zeros = (x===0?1:0)+(y===0?1:0)+(z===0?1:0);
+          if (zeros < 2)
+            out.push(...mengerCubes(lv-1, cx+x*s3, cy+y*s3, cz+z*s3, s3));
+        }
+    return out;
+  }
+
+  const cubes = mengerCubes(2, 0, 0, 0, 2);
+  cubes.forEach(([cx,cy,cz,s]) => {
+    const pts = cubeEdges(cx, cy, cz, s);
+    const geo = new THREE.BufferGeometry().setFromPoints(pts);
+    const isCorner = Math.abs(cx) > 0.5 && Math.abs(cy) > 0.5 && Math.abs(cz) > 0.5;
+    scene.add(new THREE.LineSegments(geo, isCorner ? material : goldMat));
+  });
+
+  function animate() {
+    requestAnimationFrame(animate);
+    const t = Date.now() * 0.0003;
+    camera.position.x = 5.5 * Math.cos(t);
+    camera.position.z = 5.5 * Math.sin(t);
+    camera.position.y = 2.5 + Math.sin(t * 0.7) * 0.5;
+    camera.lookAt(0, 0, 0);
+    renderer.render(scene, camera);
+  }
+  animate();
+
+  window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+  });
+})();
+</script>
+
+<!-- ════════ WIZARD + COMPUTE LOGIC ════════ -->
+<script>
+const API = window.HIVE_SERVER || window.location.origin;
+let currentStep = 0;
+let config = { name: '', intensity: 2, charging: true, battery: true, background: true };
+let apiKey = null;
+let workerId = null;
+let paused = false;
+let jobsDone = 0;
+let worker = null;
+
+// ── Wizard Navigation ──
+
+function nextStep() {
+  if (currentStep === 1) {
+    const name = document.getElementById('worker-name').value.trim();
+    if (!name) { document.getElementById('worker-name').focus(); return; }
+    config.name = name;
+  }
+  document.getElementById('step-' + currentStep).classList.remove('active');
+  document.getElementById('dot-' + currentStep).classList.remove('current');
+  document.getElementById('dot-' + currentStep).classList.add('done');
+  currentStep++;
+  document.getElementById('step-' + currentStep).classList.add('active');
+  document.getElementById('dot-' + currentStep).classList.add('current');
+}
+
+function prevStep() {
+  document.getElementById('step-' + currentStep).classList.remove('active');
+  document.getElementById('dot-' + currentStep).classList.remove('current');
+  currentStep--;
+  document.getElementById('step-' + currentStep).classList.add('active');
+  document.getElementById('dot-' + currentStep).classList.add('current');
+  document.getElementById('dot-' + currentStep).classList.remove('done');
+}
+
+function updateIntensity(v) {
+  const labels = {1: 'Low', 2: 'Medium', 3: 'High'};
+  document.getElementById('intensity-val').textContent = labels[v];
+  config.intensity = parseInt(v);
+}
+
+function toggleSwitch(el) {
+  el.classList.toggle('on');
+}
+
+// ── Save/load config from localStorage ──
+
+function saveLocal() {
+  localStorage.setItem('whome_config', JSON.stringify({ apiKey, workerId, config }));
+}
+
+function loadLocal() {
+  try {
+    const d = JSON.parse(localStorage.getItem('whome_config'));
+    if (d && d.apiKey) {
+      apiKey = d.apiKey;
+      workerId = d.workerId;
+      config = d.config || config;
+      return true;
+    }
+  } catch(e) {}
+  return false;
+}
+
+// ── Registration ──
+
+async function registerWorker() {
+  const resp = await fetch(API + '/register', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ name: config.name, gpu_info: 'WebAssembly (Browser)' })
+  });
+  const data = await resp.json();
+  apiKey = data.api_key;
+  workerId = data.worker_id;
+  saveLocal();
+  return data;
+}
+
+// ── Compute ──
+
+function log(msg, cls) {
+  const feed = document.getElementById('log-feed');
+  const div = document.createElement('div');
+  if (cls) div.className = cls;
+  div.textContent = msg;
+  feed.insertBefore(div, feed.firstChild);
+  if (feed.children.length > 100) feed.removeChild(feed.lastChild);
+}
+
+function setStage(n) {
+  for (let i = 0; i < 5; i++) {
+    const d = document.getElementById('sd-' + i);
+    d.className = 'dot' + (i < n ? ' done' : i === n ? ' active' : '');
+  }
+}
+
+async function startCompute() {
+  const btn = document.getElementById('start-btn');
+  btn.innerHTML = '<span class="loader"></span>Loading Pyodide...';
+  btn.disabled = true;
+
+  // Check for existing session
+  if (!loadLocal()) {
+    await registerWorker();
+  }
+
+  // Switch to compute view
+  document.getElementById('wizard-view').style.display = 'none';
+  document.getElementById('compute-view').classList.add('active');
+
+  log('Registered as ' + workerId, 'info');
+  log('Loading Python runtime (first time takes ~20s)...', 'info');
+
+  // Load Pyodide
+  try {
+    const script = document.createElement('script');
+    script.src = 'https://cdn.jsdelivr.net/pyodide/v0.25.1/full/pyodide.js';
+    document.head.appendChild(script);
+    await new Promise((resolve, reject) => {
+      script.onload = resolve;
+      script.onerror = reject;
+    });
+
+    log('Pyodide loaded. Installing numpy + scipy...', 'info');
+    const pyodide = await loadPyodide();
+    await pyodide.loadPackage(['numpy', 'scipy']);
+    log('Runtime ready. Fetching compute kernel...', 'ok');
+
+    // Fetch w_operator.py from server
+    const wopResp = await fetch(API + '/static/w_operator.py');
+    const wopCode = await wopResp.text();
+    pyodide.runPython(wopCode);
+    log('Compute kernel loaded. Starting work loop...', 'ok');
+
+    // Main compute loop
+    computeLoop(pyodide);
+
+  } catch(e) {
+    log('Error loading runtime: ' + e.message, 'hit');
+    document.getElementById('lambda-display').textContent = 'Load failed — try refreshing';
+  }
+}
+
+async function computeLoop(pyodide) {
+  while (true) {
+    if (paused) {
+      await sleep(1000);
+      continue;
+    }
+
+    // Battery check
+    if (config.battery && navigator.getBattery) {
+      try {
+        const batt = await navigator.getBattery();
+        if (batt.level < 0.2 && !batt.charging) {
+          document.getElementById('lambda-display').textContent = 'Paused — battery low';
+          log('Battery < 20%, pausing...', 'info');
+          await sleep(30000);
+          continue;
+        }
+        if (config.charging && !batt.charging) {
+          document.getElementById('lambda-display').textContent = 'Waiting for charger...';
+          await sleep(10000);
+          continue;
+        }
+      } catch(e) {}
+    }
+
+    try {
+      // Pull job
+      const jobResp = await fetch(API + '/job', {
+        method: 'POST',
+        headers: {'x-api-key': apiKey}
+      });
+      const jobData = await jobResp.json();
+
+      if (jobData.status === 'no_jobs') {
+        log('All jobs assigned. Waiting...', 'info');
+        document.getElementById('lambda-display').textContent = 'Waiting for jobs...';
+        await sleep(30000);
+        continue;
+      }
+
+      if (jobData.status !== 'assigned') {
+        log('Unexpected response: ' + JSON.stringify(jobData), 'info');
+        await sleep(5000);
+        continue;
+      }
+
+      // Update progress stats
+      if (jobData.progress) {
+        const p = jobData.progress;
+        document.getElementById('s-workers').textContent = p.active_workers;
+        document.getElementById('s-pct').textContent = p.percent_complete.toFixed(2) + '%';
+        document.getElementById('s-discoveries').textContent = p.total_discoveries;
+      }
+
+      const params = jobData.params;
+      const jobId = jobData.job_id;
+      const lam = params.lambda;
+
+      document.getElementById('lambda-display').innerHTML =
+        '&lambda; = <strong>' + lam.toFixed(6) + '</strong> &nbsp; Job #' + jobId;
+
+      if (jobData.resumed) {
+        log('Resuming job #' + jobId + ' (lambda=' + lam.toFixed(6) + ')', 'info');
+      } else {
+        log('Starting job #' + jobId + ' (lambda=' + lam.toFixed(6) + ')', 'info');
+      }
+
+      // Run computation in Pyodide
+      const t0 = performance.now();
+
+      // Use lower k for browser (k=2 or k=3 based on intensity)
+      const k = config.intensity >= 3 ? 3 : 2;
+
+      setStage(0);
+      log('  Building graph (k=' + k + ')...', '');
+      await sleep(10); // yield to UI
+
+      const result = pyodide.runPython(`
+import json, time, numpy as np
+import w_operator as wop
+
+k = ${k}
+G1 = G2 = ${params.G1 || 16}
+S = ${params.S || 8}
+lam = ${lam}
+w_glue = ${params.w_glue || 1000.0}
+N = 2
+
+# Stage 1: Build Graph
+vertices, edges, b_ids = wop.build_graph(k, G1, G2, S, N)
+
+# Stage 2: Add Glue
+upd, psi_by = wop.add_glue_edges(vertices, b_ids, lam, w_glue, G1, G2)
+
+# Stage 3: Merge
+edges_merged = wop.merge_edges(edges, upd)
+
+# Stage 4: Laplacian
+L, _ = wop.build_magnetic_laplacian(vertices, edges_merged, s=(0,0), psi_by_id=psi_by)
+
+# Stage 5: Solve
+eigs = wop.solve_spectrum(L, M=40)
+
+# Check for constants
+CONSTANTS = {
+    "phi": 1.6180339887, "e": 2.718281828, "pi": 3.141592653,
+    "alpha_inv": 137.035999, "proton_electron": 1836.15267,
+}
+eigs_nz = np.sort(eigs[eigs > 1e-9])
+hits = []
+cap = min(len(eigs_nz), 60)
+for i in range(cap):
+    for j in range(i+1, cap):
+        ratio = eigs_nz[j] / eigs_nz[i]
+        for name, val in CONSTANTS.items():
+            if abs(ratio - val) / val < 1e-4:
+                hits.append(f"{name} (ratio={ratio:.6f})")
+
+json.dumps({
+    "eigenvalues": [round(float(x), 12) for x in sorted(eigs)],
+    "hits": hits,
+    "n_vertices": len(vertices),
+})
+      `);
+
+      setStage(5);
+      const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
+      const resultData = JSON.parse(result);
+
+      log('  Complete: ' + resultData.n_vertices + ' vertices, ' + elapsed + 's', 'ok');
+
+      // Hash eigenvalues
+      const sorted_eigs = resultData.eigenvalues.sort((a,b) => a-b);
+      const hashPayload = JSON.stringify(sorted_eigs.map(e => parseFloat(e.toFixed(12))));
+      const hashBuffer = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(hashPayload));
+      const eigHash = Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2,'0')).join('');
+
+      // Report hits
+      if (resultData.hits.length > 0) {
+        resultData.hits.forEach(h => log('  RESONANCE: ' + h, 'hit'));
+      }
+
+      // Submit result
+      await fetch(API + '/result', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json', 'x-api-key': apiKey},
+        body: JSON.stringify({
+          job_id: jobId,
+          eigenvalues: resultData.eigenvalues,
+          eigenvalues_hash: eigHash,
+          found_constants: resultData.hits,
+          compute_seconds: parseFloat(elapsed),
+        })
+      });
+
+      jobsDone++;
+      document.getElementById('s-jobs').textContent = jobsDone;
+      log('  Submitted to Hive', 'ok');
+
+    } catch(e) {
+      log('Error: ' + e.message, 'hit');
+      await sleep(5000);
+    }
+
+    await sleep(100); // brief yield between jobs
+  }
+}
+
+function togglePause() {
+  paused = !paused;
+  document.getElementById('pause-btn').textContent = paused ? 'Resume' : 'Pause';
+  document.getElementById('lambda-display').textContent = paused ? 'Paused' : 'Resuming...';
+  log(paused ? 'Paused by user' : 'Resumed', 'info');
+}
+
+function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// ── Auto-resume if returning user ──
+if (loadLocal()) {
+  // Skip wizard, go straight to compute
+  document.getElementById('wizard-view').style.display = 'none';
+  document.getElementById('compute-view').classList.add('active');
+  document.getElementById('lambda-display').textContent = 'Reconnecting...';
+
+  // Need to reload Pyodide
+  startCompute();
+}
+</script>
+
+</body>
+</html>
