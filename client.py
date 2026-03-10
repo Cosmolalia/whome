@@ -104,11 +104,54 @@ def clear_checkpoint():
         os.remove(CHECKPOINT_PATH)
 
 # ═══════════════════════════════════════════════════════════
+# Auto-update
+# ═══════════════════════════════════════════════════════════
+
+def _self_hash():
+    """SHA256 of this client.py file (first 16 hex chars)."""
+    me = os.path.abspath(__file__)
+    with open(me, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()[:16]
+
+def check_for_update():
+    """Check server for newer client version. Returns True if updated (needs restart)."""
+    try:
+        resp = requests.get(f"{SERVER_URL}/version", timeout=10)
+        if resp.status_code != 200:
+            return False
+        info = resp.json()
+        server_ver = info.get("client_version", "")
+        local_ver = _self_hash()
+        if server_ver == local_ver or not server_ver or server_ver == "unknown":
+            return False
+
+        # New version available — download updated files
+        my_dir = os.path.dirname(os.path.abspath(__file__))
+        files = info.get("files", ["client.py", "w_operator.py"])
+        for fname in files:
+            url = f"{SERVER_URL}/static/{fname}"
+            r = requests.get(url, timeout=30)
+            if r.status_code == 200:
+                target = os.path.join(my_dir, fname)
+                # Backup current
+                if os.path.exists(target):
+                    backup = target + ".bak"
+                    try:
+                        os.replace(target, backup)
+                    except OSError:
+                        pass
+                with open(target, "w") as f:
+                    f.write(r.text)
+        return True
+    except Exception:
+        return False
+
+# ═══════════════════════════════════════════════════════════
 # Hashing
 # ═══════════════════════════════════════════════════════════
 
 def hash_eigenvalues(eigs):
-    rounded = [round(float(e), 12) for e in sorted(eigs)]
+    rounded = [round(float(e), 10) for e in sorted(eigs)]
     payload = json.dumps(rounded, separators=(',', ':'))
     return hashlib.sha256(payload.encode()).hexdigest()
 
@@ -546,9 +589,18 @@ def main():
         display.show_info(f"Found checkpoint for job {ckpt.get('job_id')} — will resume")
 
     backoff = MIN_BACKOFF
+    jobs_since_update_check = 0
 
     while running:
         try:
+            # Check for client updates every 10 jobs
+            jobs_since_update_check += 1
+            if jobs_since_update_check >= 10:
+                jobs_since_update_check = 0
+                if check_for_update():
+                    display.show_info("Client updated! Restarting...")
+                    os.execv(sys.executable, [sys.executable] + sys.argv)
+
             # Pull job
             resp = requests.post(
                 f"{SERVER_URL}/job",

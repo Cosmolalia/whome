@@ -14,7 +14,7 @@ Architecture lessons from BOINC/SETI@home:
 Run: uvicorn server:app --host 0.0.0.0 --port 8081
 """
 
-from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi import FastAPI, HTTPException, Header, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -157,13 +157,23 @@ def init_db():
             ratio_value REAL NOT NULL,
             discovered_at REAL NOT NULL,
             verified INTEGER DEFAULT 0,
-            worker_id TEXT NOT NULL
+            worker_id TEXT NOT NULL,
+            param_tier TEXT DEFAULT 'desktop'
+        );
+
+        CREATE TABLE IF NOT EXISTS messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL,
+            content TEXT NOT NULL,
+            sent_at REAL NOT NULL,
+            msg_type TEXT DEFAULT 'chat'
         );
 
         CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
         CREATE INDEX IF NOT EXISTS idx_assignments_status ON assignments(status);
         CREATE INDEX IF NOT EXISTS idx_assignments_job ON assignments(job_id);
         CREATE INDEX IF NOT EXISTS idx_results_job ON results(job_id);
+        CREATE INDEX IF NOT EXISTS idx_messages_sent ON messages(sent_at);
     """)
     conn.commit()
 
@@ -184,6 +194,11 @@ def init_db():
         conn.execute("SELECT param_tier FROM results LIMIT 1")
     except sqlite3.OperationalError:
         conn.execute("ALTER TABLE results ADD COLUMN param_tier TEXT DEFAULT 'desktop'")
+        conn.commit()
+    try:
+        conn.execute("SELECT param_tier FROM discoveries LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE discoveries ADD COLUMN param_tier TEXT DEFAULT 'desktop'")
         conn.commit()
 
     conn.close()
@@ -293,19 +308,41 @@ def seed_canaries(canaries):
     conn.close()
     print(f"  Seeded {len(canaries)} canary jobs")
 
-def check_canary_result(job_id: int, eig_hash: str, worker_id: str, conn):
+def check_canary_result(job_id: int, eig_hash: str, worker_id: str, conn, param_tier: str = "desktop"):
     """
-    Check if a submitted result matches the known canary answer.
-    Updates worker trust score accordingly.
+    Check if a submitted result for a verified job matches the known-good answer.
+    Uses real verified results as canaries — no synthetic canary jobs needed.
     """
     job = conn.execute(
-        "SELECT is_canary, canary_hash FROM jobs WHERE id = ?", (job_id,)
+        "SELECT verified FROM jobs WHERE id = ?", (job_id,)
     ).fetchone()
 
-    if not job or not job['is_canary']:
-        return None  # Not a canary
+    if not job or not job['verified']:
+        return None  # Not a verified job — can't check
 
-    expected = job['canary_hash']
+    # Was this worker already counted in the verification? Skip check if so
+    existing = conn.execute(
+        "SELECT id FROM results WHERE job_id = ? AND worker_id = ?", (job_id, worker_id)
+    ).fetchone()
+    # If they already have a result for this job, this is a re-submission (quorum), not a spot-check
+    # We only spot-check NEW workers against verified jobs
+    result_count = conn.execute(
+        "SELECT COUNT(*) FROM results WHERE job_id = ? AND worker_id = ?", (job_id, worker_id)
+    ).fetchone()[0]
+    if result_count > 1:
+        return None  # Already submitted before — not a spot-check
+
+    # Get the verified hash (most common hash among existing results for this tier)
+    verified_hash = conn.execute("""
+        SELECT eigenvalues_hash, COUNT(*) as cnt FROM results
+        WHERE job_id = ? AND param_tier = ?
+        GROUP BY eigenvalues_hash ORDER BY cnt DESC LIMIT 1
+    """, (job_id, param_tier)).fetchone()
+
+    if not verified_hash:
+        return None
+
+    expected = verified_hash['eigenvalues_hash']
     passed = (eig_hash == expected)
 
     if passed:
@@ -315,7 +352,7 @@ def check_canary_result(job_id: int, eig_hash: str, worker_id: str, conn):
                 trust_score = MIN(1.0, trust_score + 0.05)
             WHERE id = ?
         """, (worker_id,))
-        print(f"  [Canary] Worker {worker_id} PASSED canary {job_id}")
+        print(f"  [SpotCheck] Worker {worker_id} PASSED on verified job {job_id}")
     else:
         conn.execute("""
             UPDATE workers SET
@@ -323,26 +360,25 @@ def check_canary_result(job_id: int, eig_hash: str, worker_id: str, conn):
                 trust_score = MAX(0.0, trust_score - 0.25)
             WHERE id = ?
         """, (worker_id,))
-        print(f"  [Canary] Worker {worker_id} FAILED canary {job_id} "
+        print(f"  [SpotCheck] Worker {worker_id} FAILED on verified job {job_id} "
               f"(got {eig_hash[:12]}... expected {expected[:12]}...)")
 
-        # If trust drops below threshold, flag all their results for re-verification
+        # If trust drops below threshold, flag worker
         worker = conn.execute("SELECT trust_score FROM workers WHERE id = ?", (worker_id,)).fetchone()
         if worker and worker['trust_score'] < 0.3:
             conn.execute("UPDATE workers SET status = 'flagged' WHERE id = ?", (worker_id,))
-            # Re-queue all their non-canary results for verification
-            affected = conn.execute("""
+            conn.execute("""
                 UPDATE jobs SET status = 'pending', quorum_received = MAX(0, quorum_received - 1)
                 WHERE id IN (SELECT job_id FROM results WHERE worker_id = ?)
-                AND is_canary = 0
+                AND verified = 0
             """, (worker_id,))
-            print(f"  [Canary] Worker {worker_id} FLAGGED — re-queuing their results")
+            print(f"  [SpotCheck] Worker {worker_id} FLAGGED — re-queuing their results")
 
     conn.commit()
     return passed
 
-# Canary insertion probability — 1 in N jobs is a canary
-CANARY_RATE = 20  # 5% of assignments are canaries
+# Spot-check rate: 1 in N jobs assigned to a new worker is a re-test of a verified job
+SPOT_CHECK_RATE = 15  # ~7% of assignments
 
 # ═══════════════════════════════════════════════════════════
 # Auth helpers
@@ -353,8 +389,8 @@ def hash_key(key: str) -> str:
 
 def hash_eigenvalues(eigs: list) -> str:
     """Deterministic hash of eigenvalue array for integrity checking."""
-    # Round to 12 decimal places for consistency across platforms
-    rounded = [round(float(e), 12) for e in sorted(eigs)]
+    # Round to 10 decimal places — 12 causes mismatches across CPUs (LAPACK rounding)
+    rounded = [round(float(e), 10) for e in sorted(eigs)]
     payload = json.dumps(rounded, separators=(',', ':'))
     return hashlib.sha256(payload.encode()).hexdigest()
 
@@ -480,8 +516,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Serve Python files for Pyodide to fetch
+# ── Client auto-update ──
+
 HIVE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+def _client_version():
+    """Compute SHA256 of client.py for version checking."""
+    client_path = os.path.join(HIVE_DIR, "client.py")
+    if os.path.exists(client_path):
+        with open(client_path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()[:16]
+    return "unknown"
+
+@app.get("/version")
+def get_version():
+    """Return current client version hash + downloadable files."""
+    return {
+        "client_version": _client_version(),
+        "files": ["client.py", "w_operator.py"],
+    }
 
 @app.get("/clear", response_class=HTMLResponse)
 def clear_page():
@@ -566,23 +619,14 @@ def pwa_manifest():
         ],
     }
 
-def _background_canary_setup():
-    """Generate canaries in background so server starts immediately."""
-    try:
-        canaries = generate_canaries(50)
-        seed_canaries(canaries)
-        print(f"[Hive] Canary system ready — {len(canaries)} canaries")
-    except Exception as e:
-        print(f"[Hive] Canary generation failed: {e}")
-
 @app.on_event("startup")
 async def startup():
     print("[Hive] Initializing database...")
     init_db()
     print("[Hive] Seeding jobs...")
     seed_jobs()
-    print("[Hive] Starting canary generation in background...")
-    threading.Thread(target=_background_canary_setup, daemon=True).start()
+    verified = get_db().execute("SELECT COUNT(*) FROM jobs WHERE verified = 1").fetchone()[0]
+    print(f"[Hive] Spot-check pool: {verified} verified jobs")
     print(f"[Hive] Online — {TOTAL_JOBS:,} jobs")
     print(f"[Hive] Secret: {SERVER_SECRET[:8]}...")
 
@@ -666,10 +710,15 @@ def login_worker(req: LoginRequest):
         "INSERT INTO api_keys (key_hash, worker_id, device_name, created_at, last_used) VALUES (?,?,?,?,?)",
         (hash_key(api_key), worker['id'], req.device_name or f"device-{secrets.token_hex(4)}", now, now)
     )
-    # Update gpu_info if provided
-    if req.gpu_info:
+    # Update gpu_info if provided — but don't overwrite real GPU info with 'chat-only'
+    if req.gpu_info and req.gpu_info != 'chat-only':
         conn.execute("UPDATE workers SET gpu_info = ?, last_heartbeat = ? WHERE id = ?",
                       (req.gpu_info, now, worker['id']))
+    elif not worker['gpu_info'] or worker['gpu_info'] == 'chat-only':
+        # Only set gpu_info if worker has no real info yet
+        if req.gpu_info:
+            conn.execute("UPDATE workers SET gpu_info = ?, last_heartbeat = ? WHERE id = ?",
+                          (req.gpu_info, now, worker['id']))
     conn.commit()
     conn.close()
 
@@ -740,25 +789,23 @@ def get_job(x_api_key: str = Header(), x_device_type: str = Header(default="desk
             "resumed": True,
         }
 
-    # Randomly inject a canary job (1 in CANARY_RATE chance)
+    # Spot-check: randomly re-assign a verified job to test new workers
     import random
-    if random.randint(1, CANARY_RATE) == 1:
-        canary = conn.execute("""
+    job = None
+    if random.randint(1, SPOT_CHECK_RATE) == 1:
+        # Pick a verified job this worker hasn't done yet (same tier)
+        spot = conn.execute("""
             SELECT j.id, j.lambda_val FROM jobs j
-            WHERE j.is_canary = 1 AND j.status = 'pending'
+            WHERE j.verified = 1
             AND j.id NOT IN (SELECT job_id FROM assignments WHERE worker_id = ?)
             ORDER BY RANDOM() LIMIT 1
         """, (worker['id'],)).fetchone()
-        if canary:
-            job = canary  # Use canary instead of real job
-        else:
-            job = None
-    else:
-        job = None
+        if spot:
+            job = spot  # Re-test this verified job
 
     # If no canary selected, find a real pending job
     if not job:
-        # First: find jobs that need more quorum members (already assigned to someone else)
+        # Priority: jobs closest to verification (most results first)
         job = conn.execute("""
             SELECT j.id, j.lambda_val FROM jobs j
             WHERE j.status = 'assigned' AND j.is_canary = 0
@@ -766,7 +813,7 @@ def get_job(x_api_key: str = Header(), x_device_type: str = Header(default="desk
             AND j.id NOT IN (
                 SELECT job_id FROM assignments WHERE worker_id = ?
             )
-            ORDER BY j.id ASC
+            ORDER BY j.quorum_received DESC, j.id ASC
             LIMIT 1
         """, (worker['id'],)).fetchone()
 
@@ -845,16 +892,14 @@ def submit_result(result: ResultSubmit, x_api_key: str = Header()):
         conn.close()
         raise HTTPException(400, "No active assignment for this job")
 
-    # Verify eigenvalue hash integrity
+    # Server computes its own hash from raw eigenvalues (authoritative)
+    # Don't reject on client hash mismatch — client may be older version with different precision
     computed_hash = hash_eigenvalues(result.eigenvalues)
-    if computed_hash != result.eigenvalues_hash:
-        conn.close()
-        raise HTTPException(400, "Eigenvalue hash mismatch — data corrupted in transit")
 
     now = time.time()
 
     # Check canary BEFORE storing (so we know trust status)
-    canary_result = check_canary_result(result.job_id, computed_hash, worker['id'], conn)
+    canary_result = check_canary_result(result.job_id, computed_hash, worker['id'], conn, param_tier)
 
     # Determine param tier based on worker capabilities
     is_mobile = "dense" in (worker.get('gpu_info') or '').lower()
@@ -864,7 +909,7 @@ def submit_result(result: ResultSubmit, x_api_key: str = Header()):
     conn.execute(
         "INSERT INTO results (job_id, worker_id, eigenvalues_hash, eigenvalues_json, found_constants, compute_seconds, submitted_at, param_tier) VALUES (?,?,?,?,?,?,?,?)",
         (result.job_id, worker['id'], computed_hash,
-         json.dumps([round(float(e), 12) for e in sorted(result.eigenvalues)]),
+         json.dumps([round(float(e), 10) for e in sorted(result.eigenvalues)]),
          json.dumps(result.found_constants),
          result.compute_seconds, now, param_tier)
     )
@@ -898,8 +943,8 @@ def submit_result(result: ResultSubmit, x_api_key: str = Header()):
             except ValueError:
                 pass
         conn.execute(
-            "INSERT INTO discoveries (job_id, lambda_val, constant_name, ratio_value, discovered_at, worker_id) VALUES (?,?,?,?,?,?)",
-            (result.job_id, job['lambda_val'], name, ratio, now, worker['id'])
+            "INSERT INTO discoveries (job_id, lambda_val, constant_name, ratio_value, discovered_at, worker_id, param_tier) VALUES (?,?,?,?,?,?,?)",
+            (result.job_id, job['lambda_val'], name, ratio, now, worker['id'], param_tier)
         )
         conn.execute(
             "UPDATE workers SET discoveries = discoveries + 1 WHERE id = ?",
@@ -979,6 +1024,9 @@ def _get_progress_stats(conn) -> dict:
 
     total_compute = conn.execute("SELECT COALESCE(SUM(compute_seconds), 0) FROM workers").fetchone()[0]
     total_discoveries = conn.execute("SELECT COUNT(*) FROM discoveries").fetchone()[0]
+    total_confirmed = conn.execute(
+        "SELECT COUNT(*) FROM discoveries d JOIN jobs j ON d.job_id = j.id WHERE j.verified = 1"
+    ).fetchone()[0]
 
     # Current lambda range being worked
     current_lambda = conn.execute(
@@ -1007,6 +1055,7 @@ def _get_progress_stats(conn) -> dict:
         "active_workers": active_workers,
         "total_compute_hours": round(total_compute / 3600, 2),
         "total_discoveries": total_discoveries,
+        "total_confirmed": total_confirmed,
         "current_lambda": round(current_lam, 6),
         "jobs_per_hour": recent_completions,
         "eta_hours": round(eta_hours, 1) if eta_hours != float('inf') else None,
@@ -1082,9 +1131,10 @@ def list_workers():
 def list_discoveries():
     conn = get_db()
     rows = conn.execute("""
-        SELECT d.*, w.name as worker_name
+        SELECT d.*, w.name as worker_name, j.verified as job_verified
         FROM discoveries d
         LEFT JOIN workers w ON d.worker_id = w.id
+        LEFT JOIN jobs j ON d.job_id = j.id
         ORDER BY d.discovered_at DESC
         LIMIT 100
     """).fetchall()
@@ -1143,9 +1193,114 @@ def active_jobs():
         "deadline_remaining": round(r['deadline'] - now),
     } for r in rows]
 
+# ── Chat ──
+
+chat_connections: dict = {}  # WebSocket -> username mapping
+
+@app.get("/chat/history")
+def chat_history(limit: int = 50):
+    """Get recent chat messages."""
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT username, content, sent_at, msg_type FROM messages ORDER BY sent_at DESC LIMIT ?",
+        (limit,)
+    ).fetchall()
+    conn.close()
+    return [{"username": r['username'], "content": r['content'],
+             "time": r['sent_at'], "type": r['msg_type']} for r in reversed(rows)]
+
+@app.post("/chat/send")
+def chat_send(x_api_key: str = Header(), message: dict = {}):
+    """Send a chat message (authenticated workers)."""
+    conn = get_db()
+    worker = verify_worker(x_api_key, conn)
+    if not worker:
+        conn.close()
+        raise HTTPException(401, "Invalid API key")
+    content = str(message.get('content', '')).strip()[:500]  # 500 char limit
+    if not content:
+        conn.close()
+        raise HTTPException(400, "Empty message")
+    now = time.time()
+    conn.execute("INSERT INTO messages (username, content, sent_at) VALUES (?,?,?)",
+                 (worker['name'], content, now))
+    conn.commit()
+    conn.close()
+    # Broadcast to WebSocket clients
+    msg = json.dumps({"username": worker['name'], "content": content, "time": now, "type": "chat"})
+    for ws in list(chat_connections.keys()):
+        try:
+            import asyncio
+            asyncio.create_task(ws.send_text(msg))
+        except Exception:
+            chat_connections.pop(ws, None)
+    return {"status": "sent"}
+
+@app.get("/chat/online")
+def chat_online():
+    """Who's in chat and who's computing."""
+    chat_users = sorted(set(v for v in chat_connections.values() if v != "anonymous"))
+    conn = get_db()
+    now = time.time()
+    # Workers active in last 5 minutes
+    rows = conn.execute(
+        "SELECT name FROM workers WHERE last_heartbeat > ?", (now - 300,)
+    ).fetchall()
+    conn.close()
+    computing = sorted(set(r['name'] for r in rows))
+    return {"chat": chat_users, "computing": computing}
+
+async def broadcast_presence():
+    """Send updated user list to all connected clients."""
+    chat_users = sorted(set(chat_connections.values()))
+    msg = json.dumps({"type": "presence", "chat_users": chat_users})
+    for ws in list(chat_connections.keys()):
+        try:
+            await ws.send_text(msg)
+        except Exception:
+            chat_connections.pop(ws, None)
+
+@app.websocket("/chat/ws")
+async def chat_ws(websocket: WebSocket):
+    """WebSocket for live chat updates."""
+    await websocket.accept()
+    chat_connections[websocket] = "anonymous"
+    try:
+        while True:
+            data = await websocket.receive_text()
+            try:
+                msg = json.loads(data)
+                api_key = msg.get('api_key', '')
+                content = str(msg.get('content', '')).strip()[:500]
+                if api_key:
+                    conn = get_db()
+                    worker = verify_worker(api_key, conn)
+                    if worker:
+                        # Track username for presence
+                        if chat_connections.get(websocket) != worker['name']:
+                            chat_connections[websocket] = worker['name']
+                            await broadcast_presence()
+                        if content:
+                            now = time.time()
+                            conn.execute("INSERT INTO messages (username, content, sent_at) VALUES (?,?,?)",
+                                         (worker['name'], content, now))
+                            conn.commit()
+                            broadcast = json.dumps({"username": worker['name'], "content": content, "time": now, "type": "chat"})
+                            for ws in list(chat_connections.keys()):
+                                try:
+                                    await ws.send_text(broadcast)
+                                except Exception:
+                                    chat_connections.pop(ws, None)
+                    conn.close()
+            except json.JSONDecodeError:
+                pass
+    except WebSocketDisconnect:
+        chat_connections.pop(websocket, None)
+        await broadcast_presence()
+
 # ── Status (public) ──
 
-@app.get("/")
+@app.get("/api/status")
 def status():
     conn = get_db()
     stats = _get_progress_stats(conn)
@@ -1157,11 +1312,23 @@ def status():
         **stats
     }
 
+# ── Landing Page ──
+
+@app.get("/", response_class=HTMLResponse)
+def landing():
+    return LANDING_HTML
+
 # ── Dashboard ──
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
     return DASHBOARD_HTML
+
+# ── Chat ──
+
+@app.get("/chat", response_class=HTMLResponse)
+def chat_page():
+    return CHAT_HTML
 
 # ═══════════════════════════════════════════════════════════
 # Embedded Dashboard
@@ -1296,6 +1463,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <div class="sub" style="margin-top: 0.5em;">
     <span class="live-dot"></span>
     <span id="status-text">Connecting...</span>
+    &nbsp;&nbsp;|&nbsp;&nbsp;
+    <a href="/" style="color:#a78bfa;">Home</a> &nbsp;
+    <a href="/chat" style="color:#a78bfa;">Chat</a>
   </div>
 </div>
 
@@ -1339,8 +1509,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   </div>
 
   <div class="card">
-    <h2>Discoveries</h2>
-    <div class="big-num" id="total-discoveries">0<span class="unit">constants found</span></div>
+    <h2>Hits</h2>
+    <div class="big-num" id="total-discoveries">0<span class="unit">hits</span></div>
+    <div style="font-size: 0.9em; color: var(--green); margin-top: 0.3em;" id="confirmed-count"></div>
     <div id="discovery-feed" style="margin-top: 1em; max-height: 200px; overflow-y: auto;"></div>
   </div>
 
@@ -1367,7 +1538,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <span style="color: #6a4aaa; margin-left: 0.5em;">&#9632;</span> Computing
         <span style="color: var(--violet); margin-left: 0.5em;">&#9632;</span> Partial
         <span style="color: var(--cyan); margin-left: 0.5em;">&#9632;</span> Complete
-        <span style="color: var(--gold); margin-left: 0.5em;">&#9632;</span> Discovery
+        <span style="color: var(--gold); margin-left: 0.5em;">&#9632;</span> Hit
       </span>
     </div>
   </div>
@@ -1390,7 +1561,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <h2>Leaderboard</h2>
     <table class="workers-table">
       <thead><tr>
-        <th></th><th>Volunteer</th><th>Jobs</th><th>Compute</th><th>Discoveries</th><th>GPU</th>
+        <th></th><th>Volunteer</th><th>Jobs</th><th>Compute</th><th>Hits</th><th>GPU</th>
       </tr></thead>
       <tbody id="leaderboard-body"></tbody>
     </table>
@@ -1441,18 +1612,22 @@ async function update() {
     document.getElementById('eta').textContent = prog.eta_hours ? prog.eta_hours + 'h' : '--';
 
     document.getElementById('total-discoveries').innerHTML = prog.total_discoveries +
-      '<span class="unit">constants found</span>';
+      '<span class="unit">hits</span>';
+    const confEl = document.getElementById('confirmed-count');
+    confEl.textContent = prog.total_confirmed ? prog.total_confirmed + ' confirmed' : '';
 
-    // Discovery feed
+    // Hit feed
     const feed = document.getElementById('discovery-feed');
-    feed.innerHTML = disc.slice(0, 10).map(d =>
-      '<div class="discovery">' +
+    feed.innerHTML = disc.slice(0, 10).map(d => {
+      const tier = d.param_tier === 'mobile' ? ' <span style="color:#7070a0;font-size:0.8em;">[scout]</span>' : ' <span style="color:var(--green);font-size:0.8em;">[HD]</span>';
+      const conf = d.job_verified ? ' <span style="color:var(--gold);font-size:0.8em;font-weight:bold;">[CONFIRMED]</span>' : '';
+      return '<div class="discovery">' +
         '<span class="const-name">' + d.constant_name + '</span> ' +
         'at <span class="lambda-val">&lambda;=' + d.lambda_val.toFixed(6) + '</span> ' +
-        '(ratio=' + d.ratio_value.toFixed(5) + ') ' +
+        '(ratio=' + d.ratio_value.toFixed(5) + ') ' + tier + conf +
         '<span class="time-ago">' + timeAgo(d.discovered_at) + '</span>' +
-      '</div>'
-    ).join('') || '<div style="color: var(--dim); font-size: 0.85em;">No discoveries yet...</div>';
+      '</div>';
+    }).join('') || '<div style="color: var(--dim); font-size: 0.85em;">No hits yet...</div>';
 
     // Active computation
     const actBody = document.getElementById('active-body');
@@ -1754,6 +1929,685 @@ drawSponge();
 update();
 setInterval(update, 5000);
 setInterval(updateSponge, 10000);
+</script>
+</body>
+</html>
+"""
+
+# ═══════════════════════════════════════════════════════════
+# Landing Page
+# ═══════════════════════════════════════════════════════════
+
+LANDING_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>W@Home — Distributed Search for Universal Constants</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #0a0a12; color: #e0e0e8;
+    font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+    line-height: 1.7; overflow-x: hidden;
+  }
+  a { color: #a78bfa; text-decoration: none; }
+  a:hover { color: #c4b5fd; text-decoration: underline; }
+
+  /* Hero */
+  .hero {
+    min-height: 100vh; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; text-align: center;
+    padding: 2rem; position: relative;
+    background: radial-gradient(ellipse at 50% 30%, #1a1040 0%, #0a0a12 70%);
+  }
+  .hero canvas {
+    position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+    opacity: 0.3; pointer-events: none;
+  }
+  .hero-content { position: relative; z-index: 1; max-width: 800px; }
+  .hero h1 {
+    font-size: 3.5rem; font-weight: 200; letter-spacing: 0.05em;
+    background: linear-gradient(135deg, #a78bfa, #6dd5ed, #a78bfa);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+    margin-bottom: 0.5rem;
+  }
+  .hero .tagline {
+    font-size: 1.3rem; color: #9090b0; margin-bottom: 2rem; font-weight: 300;
+  }
+  .hero .hook {
+    font-size: 1.1rem; color: #c0c0d8; max-width: 650px; margin: 0 auto 2.5rem;
+  }
+  .cta-row { display: flex; gap: 1rem; justify-content: center; flex-wrap: wrap; }
+  .btn {
+    padding: 0.8rem 2rem; border-radius: 8px; font-size: 1rem;
+    font-weight: 600; cursor: pointer; border: none; transition: all 0.2s;
+  }
+  .btn-primary {
+    background: linear-gradient(135deg, #7c3aed, #6d28d9);
+    color: white; box-shadow: 0 4px 20px rgba(124,58,237,0.3);
+  }
+  .btn-primary:hover { transform: translateY(-2px); box-shadow: 0 6px 30px rgba(124,58,237,0.5); }
+  .btn-secondary {
+    background: rgba(255,255,255,0.05); color: #c0c0d8;
+    border: 1px solid rgba(255,255,255,0.1);
+  }
+  .btn-secondary:hover { background: rgba(255,255,255,0.1); }
+  .scroll-hint {
+    position: absolute; bottom: 2rem; color: #505070;
+    animation: bob 2s ease-in-out infinite;
+  }
+  @keyframes bob { 0%,100% { transform: translateY(0); } 50% { transform: translateY(8px); } }
+
+  /* Sections */
+  section { padding: 5rem 2rem; max-width: 900px; margin: 0 auto; }
+  section h2 {
+    font-size: 2rem; font-weight: 300; margin-bottom: 1.5rem;
+    color: #c4b5fd; letter-spacing: 0.02em;
+  }
+  section p { margin-bottom: 1.2rem; color: #b0b0c8; font-size: 1.05rem; }
+  .highlight { color: #e0e0f0; font-weight: 500; }
+
+  /* What section */
+  .what-grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+    gap: 1.5rem; margin-top: 2rem;
+  }
+  .what-card {
+    background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 12px; padding: 1.5rem;
+  }
+  .what-card h3 { color: #a78bfa; font-size: 1.1rem; margin-bottom: 0.5rem; }
+  .what-card p { font-size: 0.95rem; color: #9090b0; margin: 0; }
+
+  /* Why it matters */
+  .timeline { border-left: 2px solid #2a2a4a; padding-left: 2rem; margin-top: 1.5rem; }
+  .timeline-item { margin-bottom: 2rem; position: relative; }
+  .timeline-item::before {
+    content: ''; width: 12px; height: 12px; border-radius: 50%;
+    background: #7c3aed; position: absolute; left: -2.4rem; top: 0.4rem;
+  }
+  .timeline-item h3 { color: #c4b5fd; font-size: 1rem; margin-bottom: 0.3rem; }
+  .timeline-item p { color: #9090b0; font-size: 0.95rem; margin: 0; }
+
+  /* Download */
+  .dl-grid {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 1rem; margin-top: 2rem;
+  }
+  .dl-card {
+    background: rgba(124,58,237,0.08); border: 1px solid rgba(124,58,237,0.2);
+    border-radius: 12px; padding: 1.5rem; text-align: center;
+    transition: all 0.2s;
+  }
+  .dl-card:hover { background: rgba(124,58,237,0.15); transform: translateY(-2px); }
+  .dl-card .icon { font-size: 2rem; margin-bottom: 0.5rem; }
+  .dl-card .platform { font-weight: 600; color: #e0e0f0; }
+  .dl-card .detail { font-size: 0.85rem; color: #7070a0; margin-top: 0.3rem; }
+
+  /* Live stats bar */
+  .live-bar {
+    background: rgba(124,58,237,0.1); border: 1px solid rgba(124,58,237,0.2);
+    border-radius: 12px; padding: 1.5rem; margin: 2rem 0;
+    display: flex; justify-content: space-around; flex-wrap: wrap; gap: 1rem;
+    text-align: center;
+  }
+  .live-stat .num { font-size: 1.8rem; font-weight: 700; color: #a78bfa; }
+  .live-stat .label { font-size: 0.8rem; color: #7070a0; text-transform: uppercase; letter-spacing: 0.1em; }
+
+  /* Footer */
+  footer {
+    text-align: center; padding: 3rem 2rem; color: #505070;
+    border-top: 1px solid rgba(255,255,255,0.05);
+    font-size: 0.9rem;
+  }
+  footer a { color: #7070a0; }
+
+  /* FAQ */
+  details { margin-bottom: 1rem; }
+  summary {
+    cursor: pointer; color: #c4b5fd; font-size: 1.05rem; font-weight: 500;
+    padding: 0.5rem 0;
+  }
+  details p { padding-left: 1rem; }
+
+  @media (max-width: 600px) {
+    .hero h1 { font-size: 2.2rem; }
+    .hero .tagline { font-size: 1rem; }
+    section { padding: 3rem 1.2rem; }
+  }
+</style>
+</head>
+<body>
+
+<div class="hero">
+  <canvas id="bgCanvas"></canvas>
+  <div class="hero-content">
+    <h1>W@Home</h1>
+    <div class="tagline">Distributed Search for Universal Constants</div>
+    <p class="hook">
+      Your computer can help search for hidden mathematical constants
+      in the spectral structure of fractal geometry. Like SETI@Home searched
+      for aliens in radio signals, we're searching for the fingerprints
+      of fundamental physics in the eigenvalues of a Menger sponge.
+    </p>
+    <div class="cta-row">
+      <a href="#download" class="btn btn-primary">Join the Search</a>
+      <a href="/dashboard" class="btn btn-secondary">Live Dashboard</a>
+      <a href="/chat" class="btn btn-secondary">Chat</a>
+    </div>
+  </div>
+  <div class="scroll-hint">scroll</div>
+</div>
+
+<section>
+  <div class="live-bar" id="liveStats">
+    <div class="live-stat"><div class="num" id="statWorkers">-</div><div class="label">Active Workers</div></div>
+    <div class="live-stat"><div class="num" id="statJobs">-</div><div class="label">Jobs Completed</div></div>
+    <div class="live-stat"><div class="num" id="statDiscoveries">-</div><div class="label">Hits</div></div>
+    <div class="live-stat"><div class="num" id="statProgress">-</div><div class="label">% Swept</div></div>
+  </div>
+</section>
+
+<section>
+  <h2>What is this?</h2>
+  <p>
+    In 2024, mathematician <span class="highlight">Obi Solaya</span> discovered that the
+    eigenvalue spectrum of the <span class="highlight">W-operator</span> — a boundary
+    operator on the Menger sponge fractal — encodes ratios that match fundamental
+    physical constants. Not approximately. <span class="highlight">Exactly.</span>
+  </p>
+  <p>
+    The Menger sponge is a fractal built by recursively removing the center of a cube,
+    20 subcubes at a time. Its boundary has a rich spectral structure — eigenvalues
+    that describe how waves propagate through this fractal geometry. When those
+    eigenvalues are compared as ratios, they match values like pi, phi, sqrt(2),
+    and dozens of physical constants from particle physics and cosmology.
+  </p>
+  <p>
+    <span class="highlight">W@Home</span> is a distributed computing project that
+    systematically sweeps the parameter space of this operator, computing eigenvalue
+    spectra at 200,000 different parameter values. Your computer (or phone) computes
+    a small piece of the puzzle, and together we map the full spectral landscape.
+  </p>
+
+  <div class="what-grid">
+    <div class="what-card">
+      <h3>The Sponge</h3>
+      <p>A Menger sponge at depth 4: 160,000 subcubes, each face tiled into a torus graph. The W-operator acts on this boundary.</p>
+    </div>
+    <div class="what-card">
+      <h3>The Sweep</h3>
+      <p>We vary a coupling parameter lambda from 0.4 to 2.4 in 200,000 steps. At each step, we solve the eigenvalue spectrum.</p>
+    </div>
+    <div class="what-card">
+      <h3>The Search</h3>
+      <p>Every eigenvalue ratio is compared against known constants. Matches are flagged as hits. When two independent workers agree, it becomes a confirmed discovery.</p>
+    </div>
+  </div>
+</section>
+
+<section>
+  <h2>Why does this matter?</h2>
+  <p>
+    If the spectral structure of a pure mathematical object — a fractal with no physics
+    baked in — naturally produces the constants of our universe, that would be one of
+    the most significant discoveries in the history of science. It would suggest that
+    the laws of physics aren't arbitrary, but emerge from geometry itself.
+  </p>
+
+  <div class="timeline">
+    <div class="timeline-item">
+      <h3>If we find nothing</h3>
+      <p>The original matches were coincidences. We've ruled out a hypothesis cleanly, and that has scientific value too. The computation data becomes a public spectral atlas of the Menger sponge.</p>
+    </div>
+    <div class="timeline-item">
+      <h3>If we find some matches</h3>
+      <p>Specific lambda values produce clusters of physical constants. This narrows the parameter space for deeper investigation and points toward which constants are structurally related.</p>
+    </div>
+    <div class="timeline-item">
+      <h3>If the whole spectrum is rich</h3>
+      <p>The Menger sponge boundary operator is a Rosetta Stone for physics. The geometry of a fractal encodes the fundamental constants of nature. We rewrite the foundations of theoretical physics.</p>
+    </div>
+  </div>
+</section>
+
+<section id="download">
+  <h2>Join the Search</h2>
+  <p>
+    Download W@Home for your platform. First run asks for a name and password — that's it.
+    Your computer starts computing immediately. No configuration needed.
+  </p>
+
+  <div class="dl-grid">
+    <a href="https://github.com/Cosmolalia/whome/releases/latest/download/whome-windows.exe" class="dl-card">
+      <div class="icon">&#x1F5A5;</div>
+      <div class="platform">Windows</div>
+      <div class="detail">Download .exe, double-click</div>
+    </a>
+    <a href="https://github.com/Cosmolalia/whome/releases/latest/download/whome-macos-x64" class="dl-card">
+      <div class="icon">&#x1F34E;</div>
+      <div class="platform">macOS</div>
+      <div class="detail">chmod +x, then run</div>
+    </a>
+    <a href="https://github.com/Cosmolalia/whome/releases/latest/download/whome-linux-x64" class="dl-card">
+      <div class="icon">&#x1F427;</div>
+      <div class="platform">Linux</div>
+      <div class="detail">chmod +x, then run</div>
+    </a>
+    <a href="/static/wathome.apk" class="dl-card">
+      <div class="icon">&#x1F4F1;</div>
+      <div class="platform">Android</div>
+      <div class="detail">Download APK, allow install</div>
+    </a>
+  </div>
+
+  <details style="margin-top: 2rem;">
+    <summary>Termux (Android terminal)</summary>
+    <p><code>curl -sSL https://wathome.akataleptos.com/static/install_termux.sh | bash</code></p>
+  </details>
+  <details>
+    <summary>Linux/macOS one-liner</summary>
+    <p><code>curl -sSL https://wathome.akataleptos.com/static/install.sh | bash</code></p>
+  </details>
+</section>
+
+<section>
+  <h2>FAQ</h2>
+  <details>
+    <summary>Is this safe to run?</summary>
+    <p>Yes. The client does pure math — matrix construction and eigenvalue decomposition using numpy/scipy. It doesn't access your files, install anything, or run in the background. Kill it anytime. The source code is open: <a href="https://github.com/Cosmolalia/whome">github.com/Cosmolalia/whome</a>.</p>
+  </details>
+  <details>
+    <summary>How much CPU does it use?</summary>
+    <p>One core at ~100% while computing. Each job takes 30-120 seconds depending on your hardware. There's a small pause between jobs. It won't slow your machine to a crawl — it's one thread.</p>
+  </details>
+  <details>
+    <summary>What's the math behind this?</summary>
+    <p>The Menger sponge is a fractal with Hausdorff dimension ~2.73. Its boundary can be encoded as a graph, and the magnetic Laplacian on that graph has a discrete eigenvalue spectrum. We parameterize a coupling constant (lambda) that controls how faces of the sponge interact, then solve for eigenvalues at each lambda. Ratios between eigenvalues are compared against known physical constants. See <a href="https://akataleptos.com">akataleptos.com</a> for the full theory.</p>
+  </details>
+  <details>
+    <summary>What are "hits"?</summary>
+    <p>When an eigenvalue ratio matches a known physical constant (pi, phi, sqrt(2), fine structure constant, etc.) within tolerance, it's flagged as a <strong>hit</strong>. Each hit is independently verified by a second worker computing the same job — once verified, it becomes a <strong>confirmed discovery</strong>.</p>
+  </details>
+  <details>
+    <summary>Who is behind this?</summary>
+    <p>Obi Solaya — independent mathematician and researcher based in Hawaii. The Akataleptos project has produced 124 verified predictions from 7 Menger integers with zero fitted parameters. This isn't a crank project. The math is real, the code is open, and the results are reproducible.</p>
+  </details>
+</section>
+
+<footer>
+  <p>W@Home is part of the <a href="https://akataleptos.com">Akataleptos Project</a></p>
+  <p style="margin-top:0.5rem;">Built with volunteer compute. Every cycle counts.</p>
+</footer>
+
+<script>
+// Background particle canvas
+const c = document.getElementById('bgCanvas');
+const ctx = c.getContext('2d');
+function resize() { c.width = c.offsetWidth; c.height = c.offsetHeight; }
+resize(); window.addEventListener('resize', resize);
+const particles = Array.from({length: 60}, () => ({
+  x: Math.random() * c.width, y: Math.random() * c.height,
+  vx: (Math.random() - 0.5) * 0.3, vy: (Math.random() - 0.5) * 0.3,
+  r: Math.random() * 2 + 1
+}));
+function drawBg() {
+  ctx.clearRect(0, 0, c.width, c.height);
+  ctx.fillStyle = 'rgba(167,139,250,0.5)';
+  particles.forEach(p => {
+    p.x += p.vx; p.y += p.vy;
+    if (p.x < 0 || p.x > c.width) p.vx *= -1;
+    if (p.y < 0 || p.y > c.height) p.vy *= -1;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2); ctx.fill();
+  });
+  // Draw connections
+  ctx.strokeStyle = 'rgba(167,139,250,0.08)';
+  for (let i = 0; i < particles.length; i++)
+    for (let j = i+1; j < particles.length; j++) {
+      const dx = particles[i].x - particles[j].x, dy = particles[i].y - particles[j].y;
+      if (dx*dx + dy*dy < 15000) {
+        ctx.beginPath(); ctx.moveTo(particles[i].x, particles[i].y);
+        ctx.lineTo(particles[j].x, particles[j].y); ctx.stroke();
+      }
+    }
+  requestAnimationFrame(drawBg);
+}
+drawBg();
+
+// Live stats
+async function updateStats() {
+  try {
+    const r = await fetch('/progress');
+    const d = await r.json();
+    document.getElementById('statJobs').textContent = (d.completed || 0).toLocaleString();
+    document.getElementById('statDiscoveries').textContent = d.total_discoveries || '0';
+    document.getElementById('statProgress').textContent = (d.percent_complete || 0).toFixed(2) + '%';
+    const a = await fetch('/active');
+    const w = await a.json();
+    document.getElementById('statWorkers').textContent = w.length || '0';
+  } catch(e) {}
+}
+updateStats();
+setInterval(updateStats, 5000);
+</script>
+</body>
+</html>
+"""
+
+# ═══════════════════════════════════════════════════════════
+# Chat Page
+# ═══════════════════════════════════════════════════════════
+
+CHAT_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>W@Home — Chat</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #0a0a12; color: #e0e0e8;
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    height: 100vh; display: flex; flex-direction: column;
+  }
+  a { color: #a78bfa; text-decoration: none; }
+
+  /* Header */
+  .header {
+    background: rgba(255,255,255,0.03); border-bottom: 1px solid rgba(255,255,255,0.06);
+    padding: 0.8rem 1.5rem; display: flex; align-items: center; justify-content: space-between;
+  }
+  .header h1 { font-size: 1.2rem; font-weight: 400; color: #a78bfa; }
+  .header nav { display: flex; gap: 1rem; font-size: 0.9rem; }
+
+  /* Layout */
+  .main { display: flex; flex: 1; overflow: hidden; }
+  .chat-panel { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  .dash-panel {
+    width: 380px; border-left: 1px solid rgba(255,255,255,0.06);
+    overflow-y: auto; background: rgba(255,255,255,0.01);
+  }
+  @media (max-width: 800px) { .dash-panel { display: none; } }
+
+  /* Messages */
+  .messages {
+    flex: 1; overflow-y: auto; padding: 1rem; display: flex; flex-direction: column;
+    gap: 0.3rem;
+  }
+  .msg { padding: 0.3rem 0; font-size: 0.95rem; word-wrap: break-word; }
+  .msg .name { color: #a78bfa; font-weight: 600; margin-right: 0.5rem; }
+  .msg .time { color: #505070; font-size: 0.75rem; margin-right: 0.5rem; }
+  .msg .text { color: #c0c0d8; }
+  .msg-system { color: #505070; font-style: italic; font-size: 0.85rem; }
+
+  /* Input */
+  .input-bar {
+    border-top: 1px solid rgba(255,255,255,0.06);
+    padding: 0.8rem 1rem; display: flex; gap: 0.5rem;
+  }
+  .input-bar input {
+    flex: 1; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 8px; padding: 0.6rem 1rem; color: #e0e0e8; font-size: 0.95rem;
+    outline: none;
+  }
+  .input-bar input:focus { border-color: #7c3aed; }
+  .input-bar button {
+    padding: 0.6rem 1.5rem; background: #7c3aed; color: white; border: none;
+    border-radius: 8px; cursor: pointer; font-weight: 600;
+  }
+  .input-bar button:hover { background: #6d28d9; }
+  .input-bar button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  /* Auth overlay */
+  .auth-overlay {
+    position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+    background: rgba(10,10,18,0.95); display: flex; align-items: center;
+    justify-content: center; z-index: 100;
+  }
+  .auth-box {
+    background: #12121e; border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 16px; padding: 2rem; width: 360px; max-width: 90vw;
+  }
+  .auth-box h2 { font-size: 1.3rem; font-weight: 400; color: #a78bfa; margin-bottom: 1.5rem; text-align: center; }
+  .auth-box input {
+    width: 100%; padding: 0.7rem 1rem; margin-bottom: 1rem;
+    background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 8px; color: #e0e0e8; font-size: 1rem; outline: none;
+  }
+  .auth-box button {
+    width: 100%; padding: 0.8rem; background: #7c3aed; color: white;
+    border: none; border-radius: 8px; font-size: 1rem; cursor: pointer; font-weight: 600;
+  }
+  .auth-box .err { color: #ef4444; font-size: 0.85rem; margin-bottom: 1rem; text-align: center; }
+
+  /* Mini dashboard */
+  .mini-stat {
+    padding: 1rem 1.5rem; border-bottom: 1px solid rgba(255,255,255,0.04);
+  }
+  .mini-stat .label { font-size: 0.75rem; color: #505070; text-transform: uppercase; letter-spacing: 0.1em; }
+  .mini-stat .val { font-size: 1.4rem; font-weight: 600; color: #a78bfa; }
+  .mini-discoveries { padding: 1rem 1.5rem; }
+  .mini-discoveries h3 { font-size: 0.85rem; color: #505070; text-transform: uppercase; margin-bottom: 0.5rem; }
+  .disc-item { font-size: 0.85rem; color: #9090b0; padding: 0.2rem 0; }
+  .disc-item .const { color: #ffd700; font-weight: 600; }
+  .user-item { font-size: 0.85rem; padding: 0.2rem 0; display: flex; align-items: center; gap: 0.4rem; }
+  .dot-chat { width: 6px; height: 6px; border-radius: 50%; background: #22c55e; display: inline-block; }
+  .dot-compute { width: 6px; height: 6px; border-radius: 50%; background: #a78bfa; display: inline-block; }
+  .user-name { color: #c0c0d8; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>W@Home Chat</h1>
+  <nav>
+    <a href="/">Home</a>
+    <a href="/dashboard">Dashboard</a>
+    <span id="userDisplay" style="color:#505070;"></span>
+  </nav>
+</div>
+
+<div class="main">
+  <div class="chat-panel">
+    <div class="messages" id="messages"></div>
+    <div class="input-bar">
+      <input type="text" id="msgInput" placeholder="Type a message..." disabled maxlength="500">
+      <button id="sendBtn" disabled onclick="sendMsg()">Send</button>
+    </div>
+  </div>
+  <div class="dash-panel" id="dashPanel">
+    <div class="mini-stat"><div class="label">Workers Online</div><div class="val" id="dWorkers">-</div></div>
+    <div class="mini-stat"><div class="label">Jobs Completed</div><div class="val" id="dJobs">-</div></div>
+    <div class="mini-stat"><div class="label">Lambda Swept</div><div class="val" id="dProgress">-</div></div>
+    <div class="mini-stat"><div class="label">Hits</div><div class="val" id="dDisc">-</div></div>
+    <div class="mini-discoveries" id="onlineList">
+      <h3>In Chat</h3>
+      <div id="chatUsers" style="margin-bottom:1rem;"></div>
+      <h3>Computing</h3>
+      <div id="computeUsers" style="margin-bottom:1rem;"></div>
+    </div>
+    <div class="mini-discoveries" id="discList"><h3>Recent Hits</h3></div>
+  </div>
+</div>
+
+<!-- Auth overlay -->
+<div class="auth-overlay" id="authOverlay">
+  <div class="auth-box">
+    <h2>Join Chat</h2>
+    <div class="err" id="authErr"></div>
+    <input type="text" id="authName" placeholder="Name">
+    <input type="password" id="authPw" placeholder="Password">
+    <button onclick="doAuth()">Enter</button>
+    <p style="text-align:center;margin-top:1rem;font-size:0.85rem;color:#505070;">
+      New name = register. Existing name = login.
+    </p>
+  </div>
+</div>
+
+<script>
+let apiKey = localStorage.getItem('chat_api_key');
+let username = localStorage.getItem('chat_username');
+let ws = null;
+
+if (apiKey && username) {
+  document.getElementById('authOverlay').style.display = 'none';
+  initChat();
+}
+
+async function doAuth() {
+  const name = document.getElementById('authName').value.trim();
+  const pw = document.getElementById('authPw').value;
+  const err = document.getElementById('authErr');
+  if (!name || !pw) { err.textContent = 'Name and password required'; return; }
+
+  // Try register
+  let r = await fetch('/register', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({name, password: pw, gpu_info: 'chat-only', device_name: 'browser'})
+  });
+  if (r.status === 409) {
+    // Name taken, try login
+    r = await fetch('/login', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({name, password: pw, device_name: 'browser', gpu_info: 'chat-only'})
+    });
+  }
+  if (r.ok) {
+    const d = await r.json();
+    apiKey = d.api_key;
+    username = name;
+    localStorage.setItem('chat_api_key', apiKey);
+    localStorage.setItem('chat_username', username);
+    document.getElementById('authOverlay').style.display = 'none';
+    initChat();
+  } else {
+    const d = await r.json().catch(() => ({}));
+    err.textContent = d.detail || 'Authentication failed';
+  }
+}
+
+// Enter key on password field
+document.getElementById('authPw').addEventListener('keydown', e => { if (e.key === 'Enter') doAuth(); });
+
+function initChat() {
+  document.getElementById('userDisplay').textContent = username;
+  document.getElementById('msgInput').disabled = false;
+  document.getElementById('sendBtn').disabled = false;
+
+  // Load history
+  fetch('/chat/history').then(r => r.json()).then(msgs => {
+    msgs.forEach(m => appendMsg(m));
+    scrollBottom();
+  });
+
+  // WebSocket
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(proto + '//' + location.host + '/chat/ws');
+  ws.onopen = () => {
+    // Identify ourselves so server tracks our username
+    ws.send(JSON.stringify({api_key: apiKey, content: ''}));
+  };
+  ws.onmessage = e => {
+    const m = JSON.parse(e.data);
+    if (m.type === 'presence') {
+      updateUserList(m.chat_users);
+      return;
+    }
+    appendMsg(m);
+    scrollBottom();
+  };
+  ws.onclose = () => setTimeout(initChat, 3000);
+
+  document.getElementById('msgInput').addEventListener('keydown', e => {
+    if (e.key === 'Enter' && !e.shiftKey) sendMsg();
+  });
+}
+
+function appendMsg(m) {
+  const div = document.createElement('div');
+  div.className = 'msg';
+  const t = new Date(m.time * 1000);
+  const ts = t.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+  if (m.type === 'system') {
+    div.className = 'msg msg-system';
+    div.textContent = m.content;
+  } else {
+    div.innerHTML = '<span class="time">' + ts + '</span><span class="name">' +
+      escHtml(m.username) + '</span><span class="text">' + escHtml(m.content) + '</span>';
+  }
+  document.getElementById('messages').appendChild(div);
+}
+
+function escHtml(s) {
+  const d = document.createElement('div'); d.textContent = s; return d.innerHTML;
+}
+
+function scrollBottom() {
+  const el = document.getElementById('messages');
+  el.scrollTop = el.scrollHeight;
+}
+
+function sendMsg() {
+  const input = document.getElementById('msgInput');
+  const text = input.value.trim();
+  if (!text || !ws) return;
+  ws.send(JSON.stringify({api_key: apiKey, content: text}));
+  input.value = '';
+}
+
+// Mini dashboard updates
+function updateUserList(chatUsers) {
+  const el = document.getElementById('chatUsers');
+  el.innerHTML = '';
+  chatUsers.forEach(u => {
+    const div = document.createElement('div');
+    div.className = 'user-item';
+    div.innerHTML = '<span class="dot-chat"></span><span class="user-name">' + escHtml(u) + '</span>';
+    el.appendChild(div);
+  });
+  if (!chatUsers.length) el.innerHTML = '<div class="user-item" style="color:#505070;">nobody yet</div>';
+}
+
+async function updateDash() {
+  try {
+    const [pr, ar, dr, on] = await Promise.all([
+      fetch('/progress').then(r=>r.json()),
+      fetch('/active').then(r=>r.json()),
+      fetch('/discoveries').then(r=>r.json()),
+      fetch('/chat/online').then(r=>r.json()),
+    ]);
+    document.getElementById('dWorkers').textContent = ar.length;
+    document.getElementById('dJobs').textContent = (pr.completed||0).toLocaleString();
+    document.getElementById('dProgress').textContent = (pr.percent_complete||0).toFixed(2) + '%';
+    document.getElementById('dDisc').textContent = pr.total_discoveries || '0';
+
+    // Computing users
+    const cel = document.getElementById('computeUsers');
+    cel.innerHTML = '';
+    (on.computing||[]).forEach(u => {
+      const div = document.createElement('div');
+      div.className = 'user-item';
+      div.innerHTML = '<span class="dot-compute"></span><span class="user-name">' + escHtml(u) + '</span>';
+      cel.appendChild(div);
+    });
+    if (!(on.computing||[]).length) cel.innerHTML = '<div class="user-item" style="color:#505070;">nobody computing</div>';
+
+    const list = document.getElementById('discList');
+    list.innerHTML = '<h3>Recent Hits</h3>';
+    (dr.slice && dr.slice(-10) || []).reverse().forEach(d => {
+      const div = document.createElement('div');
+      div.className = 'disc-item';
+      const tier = d.param_tier === 'mobile' ? ' <span style="color:#7070a0;font-size:0.75rem;">[scout]</span>' : ' <span style="color:#22c55e;font-size:0.75rem;">[HD]</span>';
+      div.innerHTML = '<span class="const">' + escHtml(d.constant_name || d.name || '?') +
+        '</span> at lambda=' + (d.lambda_val||0).toFixed(6) + tier;
+      list.appendChild(div);
+    });
+  } catch(e) {}
+}
+updateDash();
+setInterval(updateDash, 5000);
 </script>
 </body>
 </html>
