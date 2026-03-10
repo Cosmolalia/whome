@@ -35,7 +35,7 @@ import numpy as np
 # Configuration
 # ═══════════════════════════════════════════════════════════
 
-SERVER_URL = os.environ.get("HIVE_SERVER", "http://localhost:8081")
+SERVER_URL = os.environ.get("HIVE_SERVER", "https://wathome.akataleptos.com")
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "worker_config.json")
 CHECKPOINT_PATH = os.path.join(os.path.dirname(__file__), "checkpoint.json")
 
@@ -313,14 +313,52 @@ def heartbeat_loop(api_key, interval=120):
 # Registration
 # ═══════════════════════════════════════════════════════════
 
-def register(name, gpu_info):
+def register(name, gpu_info, password=""):
     """Register with the Hive, get API key."""
+    import platform
+    device_name = platform.node()
     resp = requests.post(f"{SERVER_URL}/register", json={
         "name": name,
         "gpu_info": gpu_info,
+        "password": password,
+        "device_name": device_name,
     })
+    if resp.status_code == 409:
+        # Name taken — offer to login instead
+        raise NameTakenError(resp.json().get('detail', 'Name already taken'))
     if resp.status_code != 200:
         raise RuntimeError(f"Registration failed: {resp.text}")
+    data = resp.json()
+    cfg = load_config()
+    cfg['api_key'] = data['api_key']
+    cfg['worker_id'] = data['worker_id']
+    cfg['name'] = name
+    cfg['server'] = SERVER_URL
+    save_config(cfg)
+    return data['api_key'], data['worker_id']
+
+
+class NameTakenError(Exception):
+    pass
+
+
+def login(name, password):
+    """Login to existing account from a new device, get fresh API key."""
+    import platform
+    device_name = platform.node()
+    resp = requests.post(f"{SERVER_URL}/login", json={
+        "name": name,
+        "password": password,
+        "device_name": device_name,
+        "gpu_info": GPU_INFO,
+    })
+    if resp.status_code != 200:
+        detail = ""
+        try:
+            detail = resp.json().get('detail', resp.text)
+        except Exception:
+            detail = resp.text
+        raise RuntimeError(f"Login failed: {detail}")
     data = resp.json()
     cfg = load_config()
     cfg['api_key'] = data['api_key']
@@ -351,8 +389,23 @@ def interactive_setup(cfg):
         name = default_name
     print(f"  \033[92m✓\033[0m Name: {name}\n")
 
+    # Password
+    import getpass
+    print("  Password protects your account so others can't use your name.")
+    print("  You'll use this password to log in from additional devices.\n")
+    while True:
+        pw = getpass.getpass("  Password (min 4 chars): ")
+        if len(pw) >= 4:
+            pw2 = getpass.getpass("  Confirm password: ")
+            if pw == pw2:
+                break
+            print("  \033[91mPasswords don't match. Try again.\033[0m\n")
+        else:
+            print("  \033[91mToo short. Minimum 4 characters.\033[0m\n")
+    print(f"  \033[92m✓\033[0m Password set\n")
+
     # Server
-    default_server = cfg.get('server', "https://akataleptos.com/hive")
+    default_server = cfg.get('server', "https://wathome.akataleptos.com")
     server = input(f"  Hive server [{default_server}]: ").strip()
     if not server:
         server = default_server
@@ -360,13 +413,14 @@ def interactive_setup(cfg):
 
     cfg['name'] = name
     cfg['server'] = server
-    return name, server
+    return name, server, pw
 
 def main():
     parser = argparse.ArgumentParser(description="W@Home Hive Worker")
     parser.add_argument("--key", help="API key (or auto-load from config)")
     parser.add_argument("--name", default="", help="Volunteer name")
     parser.add_argument("--server", default=None, help="Hive server URL")
+    parser.add_argument("--login", action="store_true", help="Log in to existing account on new device")
     parser.add_argument("--screensaver", action="store_true", help="Run in screensaver mode")
     parser.add_argument("--nice", type=int, default=10, help="Process nice level (0-19)")
     args = parser.parse_args()
@@ -374,15 +428,34 @@ def main():
     global SERVER_URL
     cfg = load_config()
 
-    # Interactive first-run wizard if no config exists and no CLI args
-    if not cfg.get('api_key') and not args.key and not args.server and not args.name:
-        name, server = interactive_setup(cfg)
-        args.name = name
-        SERVER_URL = server
-    elif args.server:
+    # Set server URL from args or config
+    if args.server:
         SERVER_URL = args.server
     elif cfg.get('server'):
         SERVER_URL = cfg['server']
+
+    # Explicit --login: authenticate existing account on this device
+    if args.login:
+        import getpass
+        name = args.name or input("  Account name: ").strip()
+        if not args.server and not cfg.get('server'):
+            server = input("  Hive server [https://wathome.akataleptos.com]: ").strip()
+            SERVER_URL = server or "https://wathome.akataleptos.com"
+        pw = getpass.getpass("  Password: ")
+        try:
+            api_key, worker_id = login(name, pw)
+            print(f"  \033[92m✓\033[0m Logged in as {name}. Key saved.\n")
+        except Exception as e:
+            print(f"  \033[91mLogin failed: {e}\033[0m")
+            sys.exit(1)
+        cfg = load_config()  # Reload after login saved it
+
+    # Interactive first-run wizard if no config exists and no CLI args
+    setup_password = None
+    if not args.login and not cfg.get('api_key') and not args.key and not args.server and not args.name:
+        name, server, setup_password = interactive_setup(cfg)
+        args.name = name
+        SERVER_URL = server
 
     # Set nice priority
     try:
@@ -398,9 +471,22 @@ def main():
     if not api_key:
         display.show_info("No API key found. Registering with Hive...")
         name = args.name or cfg.get('name', f"worker-{os.getpid()}")
+        # Get password if we don't have one from interactive setup
+        if not setup_password:
+            import getpass
+            setup_password = getpass.getpass("  Password: ")
         try:
-            api_key, worker_id = register(name, GPU_INFO)
+            api_key, worker_id = register(name, GPU_INFO, password=setup_password)
             display.show_info(f"Registered as {worker_id}. API key saved to {CONFIG_PATH}")
+        except NameTakenError:
+            # Name exists — try logging in instead
+            display.show_info(f"Name '{name}' already registered. Logging in...")
+            try:
+                api_key, worker_id = login(name, setup_password)
+                display.show_info(f"Logged in as {name}. New device key saved to {CONFIG_PATH}")
+            except Exception as e2:
+                display.show_error(f"Login failed: {e2}")
+                sys.exit(1)
         except Exception as e:
             display.show_error(f"Registration failed: {e}")
             sys.exit(1)

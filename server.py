@@ -77,6 +77,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS workers (
             id TEXT PRIMARY KEY,
             api_key_hash TEXT NOT NULL,
+            password_hash TEXT DEFAULT '',
             name TEXT DEFAULT '',
             registered_at REAL NOT NULL,
             last_heartbeat REAL NOT NULL,
@@ -88,6 +89,14 @@ def init_db():
             trust_score REAL DEFAULT 1.0,
             canaries_passed INTEGER DEFAULT 0,
             canaries_failed INTEGER DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS api_keys (
+            key_hash TEXT PRIMARY KEY,
+            worker_id TEXT NOT NULL,
+            device_name TEXT DEFAULT '',
+            created_at REAL NOT NULL,
+            last_used REAL NOT NULL,
+            FOREIGN KEY (worker_id) REFERENCES workers(id)
         );
 
         CREATE TABLE IF NOT EXISTS jobs (
@@ -147,6 +156,21 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_results_job ON results(job_id);
     """)
     conn.commit()
+
+    # Migrate existing DBs: add columns/tables that may not exist
+    try:
+        conn.execute("SELECT password_hash FROM workers LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE workers ADD COLUMN password_hash TEXT DEFAULT ''")
+        conn.commit()
+    try:
+        conn.execute("SELECT trust_score FROM workers LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE workers ADD COLUMN trust_score REAL DEFAULT 1.0")
+        conn.execute("ALTER TABLE workers ADD COLUMN canaries_passed INTEGER DEFAULT 0")
+        conn.execute("ALTER TABLE workers ADD COLUMN canaries_failed INTEGER DEFAULT 0")
+        conn.commit()
+
     conn.close()
 
 def seed_jobs(batch_size=1000):
@@ -319,9 +343,27 @@ def hash_eigenvalues(eigs: list) -> str:
     payload = json.dumps(rounded, separators=(',', ':'))
     return hashlib.sha256(payload.encode()).hexdigest()
 
+def hash_password(password: str) -> str:
+    """Hash password with salt using SHA256. Not bcrypt (no extra dep), but salted."""
+    salt = hashlib.sha256(SERVER_SECRET.encode()).hexdigest()[:16]
+    return hashlib.sha256(f"{salt}:{password}".encode()).hexdigest()
+
+def verify_password(password: str, stored_hash: str) -> bool:
+    return hash_password(password) == stored_hash
+
 def verify_worker(api_key: str, conn) -> Optional[dict]:
     """Verify API key, return worker row or None."""
     key_hash = hash_key(api_key)
+    # Check new api_keys table first
+    ak = conn.execute("SELECT worker_id FROM api_keys WHERE key_hash = ?", (key_hash,)).fetchone()
+    if ak:
+        conn.execute("UPDATE api_keys SET last_used = ? WHERE key_hash = ?", (time.time(), key_hash))
+        row = conn.execute("SELECT * FROM workers WHERE id = ?", (ak['worker_id'],)).fetchone()
+        if row:
+            conn.execute("UPDATE workers SET last_heartbeat = ? WHERE id = ?", (time.time(), row['id']))
+            conn.commit()
+            return dict(row)
+    # Fallback: check legacy api_key_hash on workers table (pre-password accounts)
     row = conn.execute("SELECT * FROM workers WHERE api_key_hash = ?", (key_hash,)).fetchone()
     if row:
         conn.execute("UPDATE workers SET last_heartbeat = ? WHERE id = ?", (time.time(), row['id']))
@@ -513,18 +555,38 @@ async def startup():
 class RegisterRequest(BaseModel):
     name: str = ""
     gpu_info: str = ""
+    password: str = ""
+    device_name: str = ""
 
 @app.post("/register")
 def register_worker(req: RegisterRequest):
-    """Register a new volunteer worker. Returns API key (save it!)."""
+    """Register a new volunteer worker. Requires a password for account security."""
+    if not req.password or len(req.password) < 4:
+        raise HTTPException(400, "Password required (minimum 4 characters)")
+    if not req.name:
+        raise HTTPException(400, "Name required")
+
     conn = get_db()
+
+    # Check if name is already taken
+    existing = conn.execute("SELECT id FROM workers WHERE name = ?", (req.name,)).fetchone()
+    if existing:
+        conn.close()
+        raise HTTPException(409, "Name already taken. Use /login to add a new device to your account.")
+
     worker_id = secrets.token_hex(8)
     api_key = secrets.token_urlsafe(32)
     now = time.time()
+    pw_hash = hash_password(req.password)
 
     conn.execute(
-        "INSERT INTO workers (id, api_key_hash, name, registered_at, last_heartbeat, gpu_info) VALUES (?,?,?,?,?,?)",
-        (worker_id, hash_key(api_key), req.name, now, now, req.gpu_info)
+        "INSERT INTO workers (id, api_key_hash, password_hash, name, registered_at, last_heartbeat, gpu_info) VALUES (?,?,?,?,?,?,?)",
+        (worker_id, hash_key(api_key), pw_hash, req.name, now, now, req.gpu_info)
+    )
+    # Also insert into api_keys table for the new multi-device flow
+    conn.execute(
+        "INSERT INTO api_keys (key_hash, worker_id, device_name, created_at, last_used) VALUES (?,?,?,?,?)",
+        (hash_key(api_key), worker_id, req.device_name or "primary", now, now)
     )
     conn.commit()
     conn.close()
@@ -532,7 +594,53 @@ def register_worker(req: RegisterRequest):
     return {
         "worker_id": worker_id,
         "api_key": api_key,
-        "message": "Welcome to the Hive. Save your API key — it cannot be recovered."
+        "message": "Welcome to the Hive. Your account is secured with your password."
+    }
+
+# ── Login (existing account, new device) ──
+
+class LoginRequest(BaseModel):
+    name: str
+    password: str
+    device_name: str = ""
+    gpu_info: str = ""
+
+@app.post("/login")
+def login_worker(req: LoginRequest):
+    """Authenticate with name+password to get a new API key (for additional devices)."""
+    conn = get_db()
+    row = conn.execute("SELECT * FROM workers WHERE name = ?", (req.name,)).fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(401, "Unknown account name")
+
+    worker = dict(row)
+    if not worker['password_hash']:
+        conn.close()
+        raise HTTPException(401, "This account was created before passwords. Re-register with a password.")
+
+    if not verify_password(req.password, worker['password_hash']):
+        conn.close()
+        raise HTTPException(401, "Wrong password")
+
+    # Issue a new API key for this device
+    api_key = secrets.token_urlsafe(32)
+    now = time.time()
+    conn.execute(
+        "INSERT INTO api_keys (key_hash, worker_id, device_name, created_at, last_used) VALUES (?,?,?,?,?)",
+        (hash_key(api_key), worker['id'], req.device_name or f"device-{secrets.token_hex(4)}", now, now)
+    )
+    # Update gpu_info if provided
+    if req.gpu_info:
+        conn.execute("UPDATE workers SET gpu_info = ?, last_heartbeat = ? WHERE id = ?",
+                      (req.gpu_info, now, worker['id']))
+    conn.commit()
+    conn.close()
+
+    return {
+        "worker_id": worker['id'],
+        "api_key": api_key,
+        "message": f"Logged in as {req.name}. New device key issued."
     }
 
 # ── Worker Update ──

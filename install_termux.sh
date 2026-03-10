@@ -1,7 +1,7 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # W@Home Hive — Termux (Android) Installer
 # Install Termux from F-Droid (NOT Play Store — the Play Store version is outdated)
-# Then run: curl -sSL https://akataleptos.com/hive/install_termux.sh | bash
+# Then run: curl -sSL https://wathome.akataleptos.com/install_termux.sh | bash
 
 set -e
 
@@ -24,7 +24,7 @@ INSTALL_DIR="$HOME/.whome"
 mkdir -p "$INSTALL_DIR"
 
 # Download files
-SERVER="${HIVE_SERVER:-https://akataleptos.com/hive}"
+SERVER="${HIVE_SERVER:-https://wathome.akataleptos.com}"
 echo ""
 echo "  Downloading W@Home..."
 for f in client.py w_operator.py; do
@@ -63,7 +63,7 @@ DEFAULT_NAME="android-$(whoami)"
 read -p "  Node name [$DEFAULT_NAME]: " NODE_NAME
 NODE_NAME="${NODE_NAME:-$DEFAULT_NAME}"
 
-DEFAULT_SERVER="https://akataleptos.com/hive"
+DEFAULT_SERVER="https://wathome.akataleptos.com"
 read -p "  Hive server [$DEFAULT_SERVER]: " SERVER_URL
 SERVER_URL="${SERVER_URL:-$DEFAULT_SERVER}"
 

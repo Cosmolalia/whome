@@ -71,7 +71,7 @@ if exist "%INSTALL_DIR%" (
 echo   Downloading W@Home...
 echo.
 
-set SERVER=https://akataleptos.com/hive
+set SERVER=https://wathome.akataleptos.com
 for %%f in (client.py w_operator.py w_cuda.py) do (
     echo   Fetching %%f...
     curl -sSf "%SERVER%/static/%%f" -o "%INSTALL_DIR%\%%f" 2>nul
@@ -125,7 +125,7 @@ echo   [OK] Name: !NODE_NAME!
 echo.
 
 :: Server
-set DEFAULT_SERVER=https://akataleptos.com/hive
+set DEFAULT_SERVER=https://wathome.akataleptos.com
 set /p HIVE_SERVER="  Hive server [%DEFAULT_SERVER%]: "
 if "!HIVE_SERVER!"=="" set HIVE_SERVER=%DEFAULT_SERVER%
 echo   [OK] Server: !HIVE_SERVER!

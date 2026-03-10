@@ -1,6 +1,6 @@
 #!/bin/bash
 # W@Home Hive — One-Click Installer
-# curl -sSL https://akataleptos.com/hive/install.sh | bash
+# curl -sSL https://wathome.akataleptos.com/install.sh | bash
 
 set -e
 
@@ -130,7 +130,7 @@ fi
 echo ""
 echo -e "  ${CYAN}Downloading W@Home...${RESET}"
 
-HIVE_SERVER="${HIVE_SERVER:-https://akataleptos.com/hive}"
+HIVE_SERVER="${HIVE_SERVER:-https://wathome.akataleptos.com}"
 
 # Try downloading from server, fall back to local copy
 for f in client.py w_operator.py w_cuda.py screensaver.py; do
@@ -184,7 +184,7 @@ echo -e "  ${GREEN}✓${RESET} Name: $NODE_NAME"
 echo ""
 
 # Server
-DEFAULT_SERVER="https://akataleptos.com/hive"
+DEFAULT_SERVER="https://wathome.akataleptos.com"
 read -p "  Hive server [$DEFAULT_SERVER]: " SERVER
 SERVER="${SERVER:-$DEFAULT_SERVER}"
 echo -e "  ${GREEN}✓${RESET} Server: $SERVER"
