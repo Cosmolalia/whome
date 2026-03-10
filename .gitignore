@@ -8,3 +8,5 @@ canaries.json
 discoveries.log
 *.egg-info/
 .env
+pyodide/
+hive_server.log

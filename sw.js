@@ -1,5 +1,5 @@
 // W@Home Service Worker — Cache Pyodide + packages for instant subsequent loads
-const CACHE_NAME = 'whome-v1';
+const CACHE_NAME = 'whome-v2';
 
 // Core app files to precache
 const PRECACHE = [
@@ -8,10 +8,10 @@ const PRECACHE = [
   '/manifest.json',
 ];
 
-// CDN resources to cache on first use (Pyodide + Three.js)
-const CDN_PATTERNS = [
-  'cdn.jsdelivr.net/pyodide',
-  'cdnjs.cloudflare.com/ajax/libs/three.js',
+// Patterns for immutable resources (cache-first: serve from cache, never re-download)
+const IMMUTABLE_PATTERNS = [
+  '/pyodide/',                              // locally-hosted Pyodide + numpy + scipy
+  'cdnjs.cloudflare.com/ajax/libs/three.js', // Three.js CDN (background animation)
 ];
 
 self.addEventListener('install', event => {
@@ -36,17 +36,18 @@ self.addEventListener('activate', event => {
 self.addEventListener('fetch', event => {
   const url = event.request.url;
 
-  // Don't cache API calls (POST requests, /job, /result, /register, etc.)
+  // Don't cache API calls (POST requests, dynamic endpoints)
   if (event.request.method !== 'GET') return;
   if (url.includes('/job') || url.includes('/result') || url.includes('/register') ||
       url.includes('/heartbeat') || url.includes('/progress') || url.includes('/workers') ||
-      url.includes('/leaderboard') || url.includes('/active') || url.includes('/worker/update')) {
+      url.includes('/leaderboard') || url.includes('/active') || url.includes('/worker/update') ||
+      url.includes('/dashboard') || url.includes('/discoveries')) {
     return;
   }
 
-  // Cache-first for CDN resources (Pyodide, Three.js — these are versioned/immutable)
-  const isCDN = CDN_PATTERNS.some(p => url.includes(p));
-  if (isCDN) {
+  // Cache-first for Pyodide/Three.js (immutable, versioned — never changes)
+  const isImmutable = IMMUTABLE_PATTERNS.some(p => url.includes(p));
+  if (isImmutable) {
     event.respondWith(
       caches.match(event.request).then(cached => {
         if (cached) return cached;
@@ -62,7 +63,7 @@ self.addEventListener('fetch', event => {
     return;
   }
 
-  // Network-first for app files (so updates propagate)
+  // Network-first for app files (compute.html, etc. — so updates propagate)
   event.respondWith(
     fetch(event.request)
       .then(response => {

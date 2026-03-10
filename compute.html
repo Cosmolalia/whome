@@ -596,23 +596,27 @@ async function startCompute() {
   log('Registered as ' + workerId, 'info');
 
   try {
-    // Step 1: Load Pyodide script
-    loadProgress(10, 'Downloading Python runtime...', '~5 MB');
+    // Step 1: Load Pyodide script from local server (no CDN dependency)
+    loadProgress(10, 'Loading Python runtime...', '');
+    const PYODIDE_URL = API + '/pyodide/';
     const script = document.createElement('script');
-    script.src = 'https://cdn.jsdelivr.net/pyodide/v0.25.1/full/pyodide.js';
+    script.src = PYODIDE_URL + 'pyodide.js';
     document.head.appendChild(script);
     await new Promise((resolve, reject) => {
       script.onload = resolve;
       script.onerror = reject;
     });
 
-    // Step 2: Initialize Pyodide
-    loadProgress(30, 'Initializing Python...', '');
+    // Step 2: Initialize Pyodide (point to our local server for all files)
+    loadProgress(30, 'Initializing Python...', '~10 MB');
     log('Loading Python runtime...', 'info');
-    const pyodide = await loadPyodide();
+    const pyodide = await loadPyodide({
+      indexURL: PYODIDE_URL,
+      lockFileURL: PYODIDE_URL + 'pyodide-lock.json',
+    });
 
-    // Step 3: Install numpy + scipy (the big ones)
-    loadProgress(50, 'Installing numpy + scipy...', '~15 MB (cached after first load)');
+    // Step 3: Install numpy + scipy from local server
+    loadProgress(50, 'Installing numpy + scipy...', '~55 MB (cached after first load)');
     log('Installing math libraries...', 'info');
     await pyodide.loadPackage(['numpy', 'scipy']);
 

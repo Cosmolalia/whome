@@ -411,6 +411,11 @@ def compute_page():
     with open(compute_path) as f:
         return f.read()
 
+MIME_TYPES = {'.py': 'text/plain', '.js': 'application/javascript', '.html': 'text/html',
+              '.png': 'image/png', '.json': 'application/json', '.css': 'text/css',
+              '.wasm': 'application/wasm', '.whl': 'application/zip', '.zip': 'application/zip',
+              '.tar': 'application/x-tar'}
+
 @app.get("/static/{filename}")
 def serve_static(filename: str):
     safe = filename.replace("..", "").replace("/", "")
@@ -418,9 +423,17 @@ def serve_static(filename: str):
     if not os.path.exists(path):
         raise HTTPException(404, "File not found")
     ext = os.path.splitext(safe)[1].lower()
-    mtype = {'.py': 'text/plain', '.js': 'application/javascript', '.html': 'text/html',
-             '.png': 'image/png', '.json': 'application/json', '.css': 'text/css'}.get(ext, 'application/octet-stream')
-    return FileResponse(path, media_type=mtype)
+    return FileResponse(path, media_type=MIME_TYPES.get(ext, 'application/octet-stream'))
+
+@app.get("/pyodide/{filename}")
+def serve_pyodide(filename: str):
+    safe = filename.replace("..", "").replace("/", "")
+    path = os.path.join(HIVE_DIR, "pyodide", safe)
+    if not os.path.exists(path):
+        raise HTTPException(404, "File not found")
+    ext = os.path.splitext(safe)[1].lower()
+    return FileResponse(path, media_type=MIME_TYPES.get(ext, 'application/octet-stream'),
+                        headers={"Cache-Control": "public, max-age=31536000"})
 
 @app.get("/sw.js")
 def service_worker():
