@@ -221,6 +221,12 @@
     height: 100%; width: 0%; background: linear-gradient(90deg, var(--cyan), var(--violet));
     border-radius: 3px; transition: width 0.3s ease;
   }
+  .progress-fill.downloading {
+    background: linear-gradient(90deg, var(--cyan), var(--violet), var(--cyan));
+    background-size: 200% 100%;
+    animation: shimmer 1.5s ease infinite;
+  }
+  @keyframes shimmer { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
   #loading-status { color: var(--text); font-size: 0.8em; }
   #loading-size { color: var(--dim); font-size: 0.75em; }
 
@@ -272,6 +278,20 @@
   </div>
 </div>
 
+<script>
+// Global error handler — shows JS errors visibly instead of crashing silently
+window.onerror = function(msg, url, line, col, err) {
+  var d = document.getElementById('crash-msg');
+  if (!d) {
+    d = document.createElement('div');
+    d.id = 'crash-msg';
+    d.style.cssText = 'position:fixed;top:0;left:0;right:0;z-index:9999;background:#1a0000;color:#ff6b6b;padding:1em;font-family:monospace;font-size:0.85em;max-height:50vh;overflow:auto;border-bottom:2px solid #ff6b6b;';
+    document.body.prepend(d);
+  }
+  d.innerHTML += '<div><b>' + msg + '</b><br>' + url + ':' + line + ':' + col + '</div>';
+  return true;
+};
+</script>
 <canvas id="bg-canvas"></canvas>
 
 <!-- ════════ WIZARD ════════ -->
@@ -399,11 +419,18 @@
   </div>
 </div>
 
-<!-- ════════ THREE.JS BACKGROUND ════════ -->
-<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<!-- ════════ THREE.JS BACKGROUND (loaded async, non-blocking) ════════ -->
 <script>
-// Menger sponge WebGL background
+// Menger sponge WebGL background — loaded lazily so page renders immediately
 (function() {
+  var s = document.createElement('script');
+  s.src = 'https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js';
+  s.async = true;
+  s.onload = initBackground;
+  s.onerror = function() { console.log('Three.js skipped — no background animation'); };
+  document.head.appendChild(s);
+})();
+function initBackground() {
   const canvas = document.getElementById('bg-canvas');
   const scene = new THREE.Scene();
   const camera = new THREE.PerspectiveCamera(45, window.innerWidth/window.innerHeight, 0.1, 100);
@@ -441,15 +468,23 @@
     return out;
   }
 
-  const cubes = mengerCubes(2, 0, 0, 0, 2);
+  // L1 Menger (20 cubes) — L2 (400 cubes) freezes weaker machines
+  const cubes = mengerCubes(1, 0, 0, 0, 2);
+  const allPts = []; const allGoldPts = [];
   cubes.forEach(([cx,cy,cz,s]) => {
     const pts = cubeEdges(cx, cy, cz, s);
-    const geo = new THREE.BufferGeometry().setFromPoints(pts);
     const isCorner = Math.abs(cx) > 0.5 && Math.abs(cy) > 0.5 && Math.abs(cz) > 0.5;
-    scene.add(new THREE.LineSegments(geo, isCorner ? material : goldMat));
+    (isCorner ? allPts : allGoldPts).push(...pts);
   });
+  // Batch into 2 draw calls instead of 400
+  if (allPts.length) scene.add(new THREE.LineSegments(new THREE.BufferGeometry().setFromPoints(allPts), material));
+  if (allGoldPts.length) scene.add(new THREE.LineSegments(new THREE.BufferGeometry().setFromPoints(allGoldPts), goldMat));
+
+  let animRunning = true;
+  window.stopBgAnimation = function() { animRunning = false; };
 
   function animate() {
+    if (!animRunning) return;
     requestAnimationFrame(animate);
     const t = Date.now() * 0.0003;
     camera.position.x = 5.5 * Math.cos(t);
@@ -465,7 +500,7 @@
     camera.updateProjectionMatrix();
     renderer.setSize(window.innerWidth, window.innerHeight);
   });
-})();
+}
 </script>
 
 <!-- ════════ WIZARD + COMPUTE LOGIC ════════ -->
@@ -594,6 +629,11 @@ async function startCompute() {
   showLoading(true);
 
   log('Registered as ' + workerId, 'info');
+  registerSW();
+
+  // Stop Three.js background animation to free up CPU/GPU for Pyodide
+  if (window.stopBgAnimation) window.stopBgAnimation();
+  document.getElementById('bg-canvas').style.display = 'none';
 
   try {
     // Step 1: Load Pyodide script from local server (no CDN dependency)
@@ -615,10 +655,28 @@ async function startCompute() {
       lockFileURL: PYODIDE_URL + 'pyodide-lock.json',
     });
 
-    // Step 3: Install numpy + scipy from local server
-    loadProgress(50, 'Installing numpy + scipy...', '~55 MB (cached after first load)');
-    log('Installing math libraries...', 'info');
+    // Step 3: Install numpy + scipy from local server (~60MB total)
+    loadProgress(50, 'Downloading numpy + scipy...', '~60 MB — only once, then cached');
+    log('Downloading math libraries (~60 MB)...', 'info');
+    // Add shimmer animation during long download
+    const bar = document.getElementById('load-progress');
+    bar.classList.add('downloading');
+    // Slowly advance bar from 50→85% during download to show activity
+    let fakePct = 50;
+    const ticker = setInterval(() => {
+      if (fakePct < 85) {
+        fakePct += 0.5;
+        bar.style.width = fakePct + '%';
+        const elapsed = ((Date.now() - loadStart) / 1000).toFixed(0);
+        document.getElementById('loading-size').textContent = elapsed + 's elapsed';
+      }
+    }, 1000);
+    const loadStart = Date.now();
     await pyodide.loadPackage(['numpy', 'scipy']);
+    clearInterval(ticker);
+    bar.classList.remove('downloading');
+    const dlTime = ((Date.now() - loadStart) / 1000).toFixed(0);
+    log('Libraries loaded in ' + dlTime + 's (cached for next time)', 'ok');
 
     // Step 4: Load compute kernel
     loadProgress(90, 'Loading compute kernel...', '');
@@ -638,8 +696,12 @@ async function startCompute() {
 
   } catch(e) {
     showLoading(false);
-    log('Error loading runtime: ' + e.message, 'hit');
-    document.getElementById('lambda-display').textContent = 'Load failed — try refreshing';
+    const errMsg = e.message || String(e);
+    log('Error: ' + errMsg, 'hit');
+    document.getElementById('lambda-display').innerHTML =
+      '<span style="color:var(--red)">Load failed</span><br>' +
+      '<span style="font-size:0.6em;color:var(--dim)">' + errMsg + '</span><br>' +
+      '<span style="font-size:0.7em">Try refreshing, or clear site data and retry</span>';
   }
 }
 
@@ -820,11 +882,13 @@ function togglePause() {
 
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// ── Service Worker Registration ──
-if ('serviceWorker' in navigator) {
-  navigator.serviceWorker.register('/sw.js')
-    .then(reg => console.log('SW registered, scope:', reg.scope))
-    .catch(err => console.log('SW registration failed:', err));
+// ── Service Worker Registration (deferred until user starts computing) ──
+function registerSW() {
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.register('/sw.js')
+      .then(reg => console.log('SW registered, scope:', reg.scope))
+      .catch(err => console.log('SW registration failed:', err));
+  }
 }
 
 // ── PWA Install Prompt ──
@@ -854,15 +918,25 @@ function dismissInstall() {
   localStorage.setItem('whome_install_dismissed', '1');
 }
 
-// ── Auto-resume if returning user ──
-if (loadLocal()) {
+// ── Reset mode: /compute?reset clears all cached state ──
+if (window.location.search.toLowerCase().includes('reset')) {
+  localStorage.clear();
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.getRegistrations().then(regs => {
+      regs.forEach(r => r.unregister());
+    });
+    caches.keys().then(keys => keys.forEach(k => caches.delete(k)));
+  }
+  window.location.replace('/compute');
+  // stop — page is redirecting
+} else if (loadLocal()) {
   // Skip wizard, go straight to compute
   document.getElementById('wizard-view').style.display = 'none';
   document.getElementById('compute-view').classList.add('active');
   document.getElementById('lambda-display').textContent = 'Reconnecting...';
 
-  // Need to reload Pyodide
-  startCompute();
+  // Small delay to let page render before heavy Pyodide load
+  setTimeout(() => startCompute(), 500);
 }
 </script>
 

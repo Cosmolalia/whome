@@ -405,6 +405,35 @@ app.add_middleware(
 # Serve Python files for Pyodide to fetch
 HIVE_DIR = os.path.dirname(os.path.abspath(__file__))
 
+@app.get("/clear", response_class=HTMLResponse)
+def clear_page():
+    return """<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>W@Home — Reset</title><style>body{background:#0a0a10;color:#a0f0ff;font-family:monospace;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;text-align:center}
+.box{max-width:400px}h2{margin-bottom:1em}#status{color:#80ffaa;margin:1em 0}a{color:#ffd06a}</style></head><body><div class="box">
+<h2>Clearing cached data...</h2><div id="status">Working...</div>
+<script>
+(async function(){
+  var s=document.getElementById('status');
+  try{
+    localStorage.clear();
+    s.textContent='localStorage cleared. ';
+    if('serviceWorker' in navigator){
+      var regs=await navigator.serviceWorker.getRegistrations();
+      for(var r of regs) await r.unregister();
+      s.textContent+='Service workers removed ('+regs.length+'). ';
+    }
+    var keys=await caches.keys();
+    for(var k of keys) await caches.delete(k);
+    s.textContent+='Caches cleared ('+keys.length+'). ';
+    s.textContent+='Done! Redirecting...';
+    setTimeout(function(){window.location.href='/compute'},1500);
+  }catch(e){
+    s.textContent='Error: '+e.message;
+    s.innerHTML+='<br><br><a href="/compute">Go to compute manually</a>';
+  }
+})();
+</script></div></body></html>"""
+
 @app.get("/compute", response_class=HTMLResponse)
 def compute_page():
     compute_path = os.path.join(HIVE_DIR, "compute.html")
