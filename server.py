@@ -51,6 +51,15 @@ JOB_PARAMS = {
     "w_glue": 1000.0,
 }
 
+# Smaller params for mobile/low-memory devices (dense eigensolver can handle ~16K vertices)
+JOB_PARAMS_MOBILE = {
+    "k": 2,
+    "G1": 8,
+    "G2": 8,
+    "S": 4,
+    "w_glue": 1000.0,
+}
+
 # Quorum: how many workers must agree on a result
 QUORUM_SIZE = 2
 
@@ -135,6 +144,7 @@ def init_db():
             n_vertices INTEGER DEFAULT 0,
             n_edges INTEGER DEFAULT 0,
             matrix_dim INTEGER DEFAULT 0,
+            param_tier TEXT DEFAULT 'desktop',
             FOREIGN KEY (job_id) REFERENCES jobs(id),
             FOREIGN KEY (worker_id) REFERENCES workers(id)
         );
@@ -169,6 +179,11 @@ def init_db():
         conn.execute("ALTER TABLE workers ADD COLUMN trust_score REAL DEFAULT 1.0")
         conn.execute("ALTER TABLE workers ADD COLUMN canaries_passed INTEGER DEFAULT 0")
         conn.execute("ALTER TABLE workers ADD COLUMN canaries_failed INTEGER DEFAULT 0")
+        conn.commit()
+    try:
+        conn.execute("SELECT param_tier FROM results LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE results ADD COLUMN param_tier TEXT DEFAULT 'desktop'")
         conn.commit()
 
     conn.close()
@@ -395,11 +410,11 @@ def verify_worker(api_key: str, conn) -> Optional[dict]:
 # Quorum validation
 # ═══════════════════════════════════════════════════════════
 
-def validate_quorum(job_id: int, conn):
-    """Check if enough results agree. If so, mark job verified."""
+def validate_quorum(job_id: int, conn, param_tier: str = "desktop"):
+    """Check if enough results agree within the same param tier. If so, mark job verified."""
     results = conn.execute(
-        "SELECT eigenvalues_hash, worker_id FROM results WHERE job_id = ?",
-        (job_id,)
+        "SELECT eigenvalues_hash, worker_id FROM results WHERE job_id = ? AND param_tier = ?",
+        (job_id, param_tier)
     ).fetchall()
 
     if len(results) < QUORUM_SIZE:
@@ -685,13 +700,18 @@ def update_worker(req: UpdateRequest, x_api_key: str = Header()):
 # ── Job Assignment ──
 
 @app.post("/job")
-def get_job(x_api_key: str = Header()):
-    """Pull the next available job. Requires API key."""
+def get_job(x_api_key: str = Header(), x_device_type: str = Header(default="desktop")):
+    """Pull the next available job. Requires API key. Send x-device-type: mobile for smaller jobs."""
     conn = get_db()
     worker = verify_worker(x_api_key, conn)
     if not worker:
         conn.close()
         raise HTTPException(401, "Invalid API key")
+
+    # Auto-detect mobile: header, or no scipy (numpy dense = can't handle large sparse matrices)
+    is_mobile = x_device_type == "mobile" or "dense" in (worker.get('gpu_info') or '').lower()
+    base_params = JOB_PARAMS_MOBILE if is_mobile else JOB_PARAMS
+    print(f"[Hive] Job request from {worker['name']}, device_type={x_device_type}, mobile={is_mobile}")
 
     # Reclaim any expired assignments
     reclaim_expired(conn)
@@ -709,7 +729,7 @@ def get_job(x_api_key: str = Header()):
         # Return existing assignment instead of creating a new one
         stats = _get_progress_stats(conn)
         conn.close()
-        params = dict(JOB_PARAMS)
+        params = dict(base_params)
         params['lambda'] = existing['lambda_val']
         return {
             "status": "assigned",
@@ -738,6 +758,20 @@ def get_job(x_api_key: str = Header()):
 
     # If no canary selected, find a real pending job
     if not job:
+        # First: find jobs that need more quorum members (already assigned to someone else)
+        job = conn.execute("""
+            SELECT j.id, j.lambda_val FROM jobs j
+            WHERE j.status = 'assigned' AND j.is_canary = 0
+            AND j.quorum_received < j.quorum_target
+            AND j.id NOT IN (
+                SELECT job_id FROM assignments WHERE worker_id = ?
+            )
+            ORDER BY j.id ASC
+            LIMIT 1
+        """, (worker['id'],)).fetchone()
+
+    if not job:
+        # Then: grab a fresh pending job
         job = conn.execute("""
             SELECT j.id, j.lambda_val FROM jobs j
             WHERE j.status = 'pending' AND j.is_canary = 0
@@ -772,7 +806,7 @@ def get_job(x_api_key: str = Header()):
     stats = _get_progress_stats(conn)
     conn.close()
 
-    params = dict(JOB_PARAMS)
+    params = dict(base_params)
     params['lambda'] = job['lambda_val']
 
     return {
@@ -822,13 +856,17 @@ def submit_result(result: ResultSubmit, x_api_key: str = Header()):
     # Check canary BEFORE storing (so we know trust status)
     canary_result = check_canary_result(result.job_id, computed_hash, worker['id'], conn)
 
+    # Determine param tier based on worker capabilities
+    is_mobile = "dense" in (worker.get('gpu_info') or '').lower()
+    param_tier = "mobile" if is_mobile else "desktop"
+
     # Store result
     conn.execute(
-        "INSERT INTO results (job_id, worker_id, eigenvalues_hash, eigenvalues_json, found_constants, compute_seconds, submitted_at) VALUES (?,?,?,?,?,?,?)",
+        "INSERT INTO results (job_id, worker_id, eigenvalues_hash, eigenvalues_json, found_constants, compute_seconds, submitted_at, param_tier) VALUES (?,?,?,?,?,?,?,?)",
         (result.job_id, worker['id'], computed_hash,
          json.dumps([round(float(e), 12) for e in sorted(result.eigenvalues)]),
          json.dumps(result.found_constants),
-         result.compute_seconds, now)
+         result.compute_seconds, now, param_tier)
     )
 
     # Update assignment
@@ -870,8 +908,8 @@ def submit_result(result: ResultSubmit, x_api_key: str = Header()):
 
     conn.commit()
 
-    # Attempt quorum validation
-    verified = validate_quorum(result.job_id, conn)
+    # Attempt quorum validation (only compare same-tier results)
+    verified = validate_quorum(result.job_id, conn, param_tier)
 
     # Mark job completed if enough results
     job_row = conn.execute("SELECT quorum_received, quorum_target FROM jobs WHERE id = ?", (result.job_id,)).fetchone()
