@@ -105,18 +105,18 @@ jobs:
 
       - name: Rename binaries
         run: |
-          mv whome-windows/whome.exe whome-windows.exe
-          mv whome-linux/whome whome-linux
-          chmod +x whome-linux
-          mv whome-macos/whome whome-macos
+          mv whome-windows/whome.exe ./whome-windows.exe
+          mv whome-linux/whome ./whome-linux-x64
+          chmod +x whome-linux-x64
+          mv whome-macos/whome ./whome-macos-x64
 
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             whome-windows.exe
-            whome-linux
-            whome-macos
+            whome-linux-x64
+            whome-macos-x64
           body: |
             ## W@Home Hive
 
