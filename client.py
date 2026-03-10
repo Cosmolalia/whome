@@ -38,6 +38,7 @@ import numpy as np
 SERVER_URL = os.environ.get("HIVE_SERVER", "https://wathome.akataleptos.com")
 CONFIG_PATH = os.path.join(os.path.dirname(__file__), "worker_config.json")
 CHECKPOINT_PATH = os.path.join(os.path.dirname(__file__), "checkpoint.json")
+RECEIPTS_PATH = os.path.join(os.path.dirname(__file__), "receipts.jsonl")
 
 # Physical constants we're hunting
 CONSTANTS = {
@@ -110,6 +111,14 @@ def hash_eigenvalues(eigs):
     rounded = [round(float(e), 12) for e in sorted(eigs)]
     payload = json.dumps(rounded, separators=(',', ':'))
     return hashlib.sha256(payload.encode()).hexdigest()
+
+def save_receipt(receipt):
+    """Append a signed receipt to the local receipts ledger."""
+    try:
+        with open(RECEIPTS_PATH, 'a') as f:
+            f.write(json.dumps(receipt) + '\n')
+    except Exception:
+        pass  # Non-critical — don't crash over receipt saving
 
 # ═══════════════════════════════════════════════════════════
 # Constant detection
@@ -608,6 +617,8 @@ def main():
                 result = resp.json()
                 if result.get('verified'):
                     display.show_info("Result verified by quorum!")
+                if result.get('receipt'):
+                    save_receipt(result['receipt'])
             else:
                 display.show_error(f"Submit failed: {resp.status_code} {resp.text}")
 
