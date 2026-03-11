@@ -29,6 +29,7 @@ import secrets
 import os
 import numpy as np
 import threading
+from collections import defaultdict
 
 # ═══════════════════════════════════════════════════════════
 # Configuration
@@ -40,7 +41,15 @@ LAMBDA_STEP = 0.000001
 TOTAL_JOBS = int((LAMBDA_END - LAMBDA_START) / LAMBDA_STEP)  # 200,000
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "hive.db")
-SERVER_SECRET = os.environ.get("HIVE_SECRET", secrets.token_hex(32))
+_secret_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "server_secret.txt")
+if os.path.exists(_secret_path):
+    SERVER_SECRET = open(_secret_path).read().strip()
+else:
+    SERVER_SECRET = os.environ.get("HIVE_SECRET", "")
+    if not SERVER_SECRET:
+        SERVER_SECRET = secrets.token_hex(32)
+        with open(_secret_path, 'w') as f:
+            f.write(SERVER_SECRET)  # persist so restarts don't break passwords
 
 # Job parameters
 JOB_PARAMS = {
@@ -159,6 +168,23 @@ def init_db():
             verified INTEGER DEFAULT 0,
             worker_id TEXT NOT NULL,
             param_tier TEXT DEFAULT 'desktop'
+        );
+
+        CREATE TABLE IF NOT EXISTS ip_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            worker_id TEXT,
+            ip TEXT NOT NULL,
+            endpoint TEXT NOT NULL,
+            timestamp REAL NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS bans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ip TEXT,
+            worker_id TEXT,
+            reason TEXT DEFAULT '',
+            banned_at REAL NOT NULL,
+            banned_by TEXT DEFAULT 'admin'
         );
 
         CREATE TABLE IF NOT EXISTS messages (
@@ -395,12 +421,22 @@ def hash_eigenvalues(eigs: list) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()
 
 def hash_password(password: str) -> str:
-    """Hash password with salt using SHA256. Not bcrypt (no extra dep), but salted."""
+    """Hash password with bcrypt (per-user salt, intentionally slow)."""
+    import bcrypt
+    return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+
+def _legacy_hash(password: str) -> str:
+    """Old SHA256 hash — only used for verifying pre-bcrypt accounts."""
     salt = hashlib.sha256(SERVER_SECRET.encode()).hexdigest()[:16]
     return hashlib.sha256(f"{salt}:{password}".encode()).hexdigest()
 
 def verify_password(password: str, stored_hash: str) -> bool:
-    return hash_password(password) == stored_hash
+    """Verify password. Supports both bcrypt and legacy SHA256 hashes."""
+    if stored_hash.startswith("$2b$") or stored_hash.startswith("$2a$"):
+        import bcrypt
+        return bcrypt.checkpw(password.encode(), stored_hash.encode())
+    # Legacy SHA256 fallback
+    return _legacy_hash(password) == stored_hash
 
 def sign_receipt(payload: dict) -> str:
     """HMAC-SHA256 sign a receipt payload. Deterministic given same secret + data."""
@@ -422,6 +458,48 @@ def make_receipt(job_id: int, worker_name: str, lambda_val: float, eigenvalues_h
     }
     payload["signature"] = sign_receipt(payload)
     return payload
+
+# ═══════════════════════════════════════════════════════════
+# Rate limiter + IP tracking
+# ═══════════════════════════════════════════════════════════
+
+_rate_buckets = defaultdict(list)  # ip -> [timestamps]
+RATE_LIMITS = {
+    "register": (3, 3600),     # 3 registrations per hour per IP
+    "login": (10, 600),        # 10 login attempts per 10 min
+    "job": (120, 60),          # 120 job requests per minute (2/s burst OK)
+    "result": (120, 60),       # same
+}
+
+def _check_rate(ip: str, endpoint: str):
+    """Raise 429 if rate limit exceeded."""
+    limit, window = RATE_LIMITS.get(endpoint, (600, 60))
+    key = f"{ip}:{endpoint}"
+    now = time.time()
+    _rate_buckets[key] = [t for t in _rate_buckets[key] if t > now - window]
+    if len(_rate_buckets[key]) >= limit:
+        raise HTTPException(429, "Too many requests. Slow down.")
+    _rate_buckets[key].append(now)
+
+def _log_ip(conn, worker_id: str, ip: str, endpoint: str):
+    """Log request IP for audit trail."""
+    conn.execute("INSERT INTO ip_log (worker_id, ip, endpoint, timestamp) VALUES (?,?,?,?)",
+                 (worker_id, ip, endpoint, time.time()))
+
+def _is_banned(conn, ip: str, worker_id: str = None) -> bool:
+    """Check if IP or worker is banned."""
+    if conn.execute("SELECT 1 FROM bans WHERE ip = ?", (ip,)).fetchone():
+        return True
+    if worker_id and conn.execute("SELECT 1 FROM bans WHERE worker_id = ?", (worker_id,)).fetchone():
+        return True
+    return False
+
+def _get_client_ip(request: Request) -> str:
+    """Get real client IP (behind nginx proxy)."""
+    forwarded = request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
 
 def verify_worker(api_key: str, conn) -> Optional[dict]:
     """Verify API key, return worker row or None."""
@@ -639,14 +717,20 @@ class RegisterRequest(BaseModel):
     device_name: str = ""
 
 @app.post("/register")
-def register_worker(req: RegisterRequest):
+def register_worker(req: RegisterRequest, request: Request):
     """Register a new volunteer worker. Requires a password for account security."""
-    if not req.password or len(req.password) < 4:
-        raise HTTPException(400, "Password required (minimum 4 characters)")
+    ip = _get_client_ip(request)
+    _check_rate(ip, "register")
+
+    if not req.password or len(req.password) < 6:
+        raise HTTPException(400, "Password required (minimum 6 characters)")
     if not req.name:
         raise HTTPException(400, "Name required")
 
     conn = get_db()
+    if _is_banned(conn, ip):
+        conn.close()
+        raise HTTPException(403, "Access denied")
 
     # Check if name is already taken
     existing = conn.execute("SELECT id FROM workers WHERE name = ?", (req.name,)).fetchone()
@@ -668,6 +752,7 @@ def register_worker(req: RegisterRequest):
         "INSERT INTO api_keys (key_hash, worker_id, device_name, created_at, last_used) VALUES (?,?,?,?,?)",
         (hash_key(api_key), worker_id, req.device_name or "primary", now, now)
     )
+    _log_ip(conn, worker_id, ip, "register")
     conn.commit()
     conn.close()
 
@@ -686,9 +771,14 @@ class LoginRequest(BaseModel):
     gpu_info: str = ""
 
 @app.post("/login")
-def login_worker(req: LoginRequest):
+def login_worker(req: LoginRequest, request: Request):
     """Authenticate with name+password to get a new API key (for additional devices)."""
+    ip = _get_client_ip(request)
+    _check_rate(ip, "login")
     conn = get_db()
+    if _is_banned(conn, ip):
+        conn.close()
+        raise HTTPException(403, "Access denied")
     row = conn.execute("SELECT * FROM workers WHERE name = ?", (req.name,)).fetchone()
     if not row:
         conn.close()
@@ -702,6 +792,11 @@ def login_worker(req: LoginRequest):
     if not verify_password(req.password, worker['password_hash']):
         conn.close()
         raise HTTPException(401, "Wrong password")
+
+    # Transparent migration: upgrade legacy SHA256 hash to bcrypt on successful login
+    if not worker['password_hash'].startswith("$2b$"):
+        conn.execute("UPDATE workers SET password_hash = ? WHERE id = ?",
+                     (hash_password(req.password), worker['id']))
 
     # Issue a new API key for this device
     api_key = secrets.token_urlsafe(32)
@@ -749,13 +844,22 @@ def update_worker(req: UpdateRequest, x_api_key: str = Header()):
 # ── Job Assignment ──
 
 @app.post("/job")
-def get_job(x_api_key: str = Header(), x_device_type: str = Header(default="desktop")):
+def get_job(request: Request, x_api_key: str = Header(), x_device_type: str = Header(default="desktop")):
     """Pull the next available job. Requires API key. Send x-device-type: mobile for smaller jobs."""
+    ip = _get_client_ip(request)
+    _check_rate(ip, "job")
     conn = get_db()
+    if _is_banned(conn, ip):
+        conn.close()
+        raise HTTPException(403, "Access denied")
     worker = verify_worker(x_api_key, conn)
     if not worker:
         conn.close()
         raise HTTPException(401, "Invalid API key")
+    if worker.get('status') == 'banned':
+        conn.close()
+        raise HTTPException(403, "Account suspended")
+    _log_ip(conn, worker['id'], ip, "job")
 
     # Auto-detect mobile: header, or no scipy (numpy dense = can't handle large sparse matrices)
     is_mobile = x_device_type == "mobile" or "dense" in (worker.get('gpu_info') or '').lower()
@@ -764,6 +868,13 @@ def get_job(x_api_key: str = Header(), x_device_type: str = Header(default="desk
 
     # Reclaim any expired assignments
     reclaim_expired(conn)
+
+    # Anti-collusion: find all worker IDs that have used this IP
+    # Don't assign same job to workers sharing an IP (prevents sock puppets)
+    same_ip_workers = [r[0] for r in conn.execute(
+        "SELECT DISTINCT worker_id FROM ip_log WHERE ip = ?", (ip,)).fetchall()]
+    if worker['id'] not in same_ip_workers:
+        same_ip_workers.append(worker['id'])
 
     # Check if this worker already has an active assignment — resume it
     existing = conn.execute("""
@@ -789,45 +900,42 @@ def get_job(x_api_key: str = Header(), x_device_type: str = Header(default="desk
             "resumed": True,
         }
 
+    # Build exclusion list: jobs already assigned to this worker OR any same-IP worker
+    placeholders = ','.join('?' * len(same_ip_workers))
+    exclude_sql = f"SELECT job_id FROM assignments WHERE worker_id IN ({placeholders})"
+
     # Spot-check: randomly re-assign a verified job to test new workers
     import random
     job = None
     if random.randint(1, SPOT_CHECK_RATE) == 1:
-        # Pick a verified job this worker hasn't done yet (same tier)
-        spot = conn.execute("""
+        spot = conn.execute(f"""
             SELECT j.id, j.lambda_val FROM jobs j
             WHERE j.verified = 1
-            AND j.id NOT IN (SELECT job_id FROM assignments WHERE worker_id = ?)
+            AND j.id NOT IN ({exclude_sql})
             ORDER BY RANDOM() LIMIT 1
-        """, (worker['id'],)).fetchone()
+        """, same_ip_workers).fetchone()
         if spot:
-            job = spot  # Re-test this verified job
+            job = spot
 
     # If no canary selected, find a real pending job
     if not job:
-        # Priority: jobs closest to verification (most results first)
-        job = conn.execute("""
+        job = conn.execute(f"""
             SELECT j.id, j.lambda_val FROM jobs j
             WHERE j.status = 'assigned' AND j.is_canary = 0
             AND j.quorum_received < j.quorum_target
-            AND j.id NOT IN (
-                SELECT job_id FROM assignments WHERE worker_id = ?
-            )
+            AND j.id NOT IN ({exclude_sql})
             ORDER BY j.quorum_received DESC, j.id ASC
             LIMIT 1
-        """, (worker['id'],)).fetchone()
+        """, same_ip_workers).fetchone()
 
     if not job:
-        # Then: grab a fresh pending job
-        job = conn.execute("""
+        job = conn.execute(f"""
             SELECT j.id, j.lambda_val FROM jobs j
             WHERE j.status = 'pending' AND j.is_canary = 0
-            AND j.id NOT IN (
-                SELECT job_id FROM assignments WHERE worker_id = ?
-            )
+            AND j.id NOT IN ({exclude_sql})
             ORDER BY j.id ASC
             LIMIT 1
-        """, (worker['id'],)).fetchone()
+        """, same_ip_workers).fetchone()
 
     if not job:
         conn.close()
@@ -874,13 +982,19 @@ class ResultSubmit(BaseModel):
     compute_seconds: float = 0.0
 
 @app.post("/result")
-def submit_result(result: ResultSubmit, x_api_key: str = Header()):
+def submit_result(result: ResultSubmit, request: Request, x_api_key: str = Header()):
     """Submit computation result with integrity hash."""
+    ip = _get_client_ip(request)
+    _check_rate(ip, "result")
     conn = get_db()
+    if _is_banned(conn, ip):
+        conn.close()
+        raise HTTPException(403, "Access denied")
     worker = verify_worker(x_api_key, conn)
     if not worker:
         conn.close()
         raise HTTPException(401, "Invalid API key")
+    _log_ip(conn, worker['id'], ip, "result")
 
     # Verify this worker was assigned this job
     assignment = conn.execute(
@@ -898,12 +1012,12 @@ def submit_result(result: ResultSubmit, x_api_key: str = Header()):
 
     now = time.time()
 
-    # Check canary BEFORE storing (so we know trust status)
-    canary_result = check_canary_result(result.job_id, computed_hash, worker['id'], conn, param_tier)
-
     # Determine param tier based on worker capabilities
     is_mobile = "dense" in (worker.get('gpu_info') or '').lower()
     param_tier = "mobile" if is_mobile else "desktop"
+
+    # Check spot-check BEFORE storing (so we know trust status)
+    canary_result = check_canary_result(result.job_id, computed_hash, worker['id'], conn, param_tier)
 
     # Store result
     conn.execute(
@@ -1317,6 +1431,118 @@ def status():
 @app.get("/", response_class=HTMLResponse)
 def landing():
     return LANDING_HTML
+
+# ═══════════════════════════════════════════════════════════
+# Admin endpoints — protected by SERVER_SECRET
+# ═══════════════════════════════════════════════════════════
+
+def _verify_admin(x_admin_key: str):
+    if not x_admin_key or x_admin_key != SERVER_SECRET:
+        raise HTTPException(403, "Invalid admin key")
+
+@app.post("/admin/ban")
+def admin_ban(request: Request, x_admin_key: str = Header(default="")):
+    """Ban a worker by ID or IP. Body: {"worker_id": "...", "ip": "...", "reason": "..."}"""
+    _verify_admin(x_admin_key)
+    import json as _json
+    # Can't use pydantic model easily, just parse body
+    # Accept worker_id and/or ip
+    return JSONResponse({"error": "use /admin/ban-worker or /admin/ban-ip"}, 400)
+
+@app.post("/admin/ban-worker/{worker_id}")
+def admin_ban_worker(worker_id: str, reason: str = "", x_admin_key: str = Header(default="")):
+    _verify_admin(x_admin_key)
+    conn = get_db()
+    conn.execute("UPDATE workers SET status = 'banned' WHERE id = ?", (worker_id,))
+    conn.execute("INSERT INTO bans (worker_id, reason, banned_at) VALUES (?,?,?)",
+                 (worker_id, reason, time.time()))
+    # Re-queue all their unverified results
+    conn.execute("""
+        UPDATE jobs SET quorum_received = quorum_received - 1, status = 'pending'
+        WHERE id IN (
+            SELECT job_id FROM results WHERE worker_id = ?
+            AND job_id NOT IN (SELECT id FROM jobs WHERE verified = 1)
+        )
+    """, (worker_id,))
+    conn.execute("""
+        DELETE FROM results WHERE worker_id = ?
+        AND job_id NOT IN (SELECT id FROM jobs WHERE verified = 1)
+    """, (worker_id,))
+    conn.commit()
+    name = conn.execute("SELECT name FROM workers WHERE id = ?", (worker_id,)).fetchone()
+    conn.close()
+    return {"status": "banned", "worker_id": worker_id, "name": name[0] if name else "unknown"}
+
+@app.post("/admin/ban-ip/{ip}")
+def admin_ban_ip(ip: str, reason: str = "", x_admin_key: str = Header(default="")):
+    _verify_admin(x_admin_key)
+    conn = get_db()
+    conn.execute("INSERT INTO bans (ip, reason, banned_at) VALUES (?,?,?)",
+                 (ip, reason, time.time()))
+    conn.commit()
+    conn.close()
+    return {"status": "banned", "ip": ip}
+
+@app.post("/admin/unban-worker/{worker_id}")
+def admin_unban_worker(worker_id: str, x_admin_key: str = Header(default="")):
+    _verify_admin(x_admin_key)
+    conn = get_db()
+    conn.execute("UPDATE workers SET status = 'active' WHERE id = ?", (worker_id,))
+    conn.execute("DELETE FROM bans WHERE worker_id = ?", (worker_id,))
+    conn.commit()
+    conn.close()
+    return {"status": "unbanned", "worker_id": worker_id}
+
+@app.post("/admin/unban-ip/{ip}")
+def admin_unban_ip(ip: str, x_admin_key: str = Header(default="")):
+    _verify_admin(x_admin_key)
+    conn = get_db()
+    conn.execute("DELETE FROM bans WHERE ip = ?", (ip,))
+    conn.commit()
+    conn.close()
+    return {"status": "unbanned", "ip": ip}
+
+@app.get("/admin/audit")
+def admin_audit(x_admin_key: str = Header(default=""), limit: int = 50):
+    """View recent activity: workers, IPs, trust scores, flagged accounts."""
+    _verify_admin(x_admin_key)
+    conn = get_db()
+    workers = [dict(r) for r in conn.execute("""
+        SELECT id, name, status, trust_score, jobs_completed, canaries_passed, canaries_failed,
+               registered_at, last_heartbeat
+        FROM workers ORDER BY last_heartbeat DESC LIMIT ?
+    """, (limit,)).fetchall()]
+    # Attach known IPs to each worker
+    for w in workers:
+        ips = conn.execute(
+            "SELECT DISTINCT ip FROM ip_log WHERE worker_id = ? ORDER BY timestamp DESC LIMIT 10",
+            (w['id'],)).fetchall()
+        w['known_ips'] = [r[0] for r in ips]
+    flagged = [w for w in workers if w['status'] in ('flagged', 'banned') or w['trust_score'] < 0.5]
+    bans = [dict(r) for r in conn.execute("SELECT * FROM bans ORDER BY banned_at DESC").fetchall()]
+    # IP collision report: IPs with multiple worker accounts
+    collisions = [dict(r) for r in conn.execute("""
+        SELECT ip, COUNT(DISTINCT worker_id) as n_workers, GROUP_CONCAT(DISTINCT worker_id) as worker_ids
+        FROM ip_log GROUP BY ip HAVING n_workers > 1 ORDER BY n_workers DESC LIMIT 20
+    """).fetchall()]
+    conn.close()
+    return {
+        "workers": workers,
+        "flagged": flagged,
+        "bans": bans,
+        "ip_collisions": collisions,
+    }
+
+@app.post("/admin/revoke-key/{worker_id}")
+def admin_revoke_keys(worker_id: str, x_admin_key: str = Header(default="")):
+    """Revoke all API keys for a worker (forces re-login)."""
+    _verify_admin(x_admin_key)
+    conn = get_db()
+    conn.execute("DELETE FROM api_keys WHERE worker_id = ?", (worker_id,))
+    conn.execute("UPDATE workers SET api_key_hash = 'revoked' WHERE id = ?", (worker_id,))
+    conn.commit()
+    conn.close()
+    return {"status": "keys_revoked", "worker_id": worker_id}
 
 # ── Dashboard ──
 
@@ -2112,7 +2338,7 @@ LANDING_HTML = """<!DOCTYPE html>
 <section>
   <h2>What is this?</h2>
   <p>
-    In 2024, mathematician <span class="highlight">Obi Solaya</span> discovered that the
+    In early 2025, researcher <span class="highlight">Sylvan Gaskin</span> discovered that the
     eigenvalue spectrum of the <span class="highlight">W-operator</span> — a boundary
     operator on the Menger sponge fractal — encodes ratios that match fundamental
     physical constants. Not approximately. <span class="highlight">Exactly.</span>
@@ -2180,35 +2406,36 @@ LANDING_HTML = """<!DOCTYPE html>
   </p>
 
   <div class="dl-grid">
-    <a href="https://github.com/Cosmolalia/whome/releases/latest/download/whome-windows.exe" class="dl-card">
+    <a href="/static/WHome-Setup.exe" class="dl-card">
       <div class="icon">&#x1F5A5;</div>
       <div class="platform">Windows</div>
-      <div class="detail">Download .exe, double-click</div>
+      <div class="detail">Download installer, double-click</div>
     </a>
-    <a href="https://github.com/Cosmolalia/whome/releases/latest/download/whome-macos-x64" class="dl-card">
+    <a href="#" onclick="return false;" class="dl-card">
       <div class="icon">&#x1F34E;</div>
       <div class="platform">macOS</div>
-      <div class="detail">chmod +x, then run</div>
+      <div class="detail">Paste the command below in Terminal</div>
     </a>
-    <a href="https://github.com/Cosmolalia/whome/releases/latest/download/whome-linux-x64" class="dl-card">
+    <a href="#" onclick="return false;" class="dl-card">
       <div class="icon">&#x1F427;</div>
       <div class="platform">Linux</div>
-      <div class="detail">chmod +x, then run</div>
+      <div class="detail">Paste the command below in Terminal</div>
     </a>
-    <a href="/static/wathome.apk" class="dl-card">
+    <a href="/static/wathome-latest.apk" class="dl-card">
       <div class="icon">&#x1F4F1;</div>
       <div class="platform">Android</div>
       <div class="detail">Download APK, allow install</div>
     </a>
   </div>
 
-  <details style="margin-top: 2rem;">
+  <div style="margin-top: 2rem; background: #12121e; border: 1px solid #2a2a3e; border-radius: 8px; padding: 1.2rem; text-align: left;">
+    <div style="color: #a0f0ff; font-weight: bold; margin-bottom: 0.5rem;">Mac / Linux — paste in Terminal:</div>
+    <code style="display: block; background: #0a0a14; padding: 0.8rem; border-radius: 4px; word-break: break-all; user-select: all; cursor: pointer;">curl -sSL https://wathome.akataleptos.com/static/install.sh | bash</code>
+    <div style="color: #505070; font-size: 0.8rem; margin-top: 0.5rem;">Installs GUI + compute worker. Sets up venv, desktop entry, and optional autostart.</div>
+  </div>
+  <details style="margin-top: 1rem;">
     <summary>Termux (Android terminal)</summary>
     <p><code>curl -sSL https://wathome.akataleptos.com/static/install_termux.sh | bash</code></p>
-  </details>
-  <details>
-    <summary>Linux/macOS one-liner</summary>
-    <p><code>curl -sSL https://wathome.akataleptos.com/static/install.sh | bash</code></p>
   </details>
 </section>
 
@@ -2232,7 +2459,7 @@ LANDING_HTML = """<!DOCTYPE html>
   </details>
   <details>
     <summary>Who is behind this?</summary>
-    <p>Obi Solaya — independent mathematician and researcher based in Hawaii. The Akataleptos project has produced 124 verified predictions from 7 Menger integers with zero fitted parameters. This isn't a crank project. The math is real, the code is open, and the results are reproducible.</p>
+    <p>Sylvan Gaskin — independent researcher of antinomics, based in Hawaii. The Akataleptos project has produced 124 verified predictions from 7 Menger integers with zero fitted parameters. This isn't a crank project. The math is real, the code is open, and the results are reproducible.</p>
   </details>
 </section>
 

@@ -72,7 +72,7 @@ echo   Downloading W@Home...
 echo.
 
 set SERVER=https://wathome.akataleptos.com
-for %%f in (client.py w_operator.py w_cuda.py) do (
+for %%f in (whome_gui.py client.py w_operator.py w_cuda.py screensaver.py) do (
     echo   Fetching %%f...
     curl -sSf "%SERVER%/static/%%f" -o "%INSTALL_DIR%\%%f" 2>nul
     if !errorlevel! neq 0 (
@@ -80,7 +80,7 @@ for %%f in (client.py w_operator.py w_cuda.py) do (
             copy /y "%~dp0%%f" "%INSTALL_DIR%\%%f" >nul
             echo   [OK] %%f (local copy)
         ) else (
-            echo   [!!] %%f not available
+            echo   [--] %%f skipped
         )
     ) else (
         echo   [OK] %%f
@@ -99,68 +99,70 @@ if not exist "%INSTALL_DIR%\venv" (
 
 call "%INSTALL_DIR%\venv\Scripts\activate.bat"
 pip install --quiet --upgrade pip
-pip install --quiet numpy scipy requests
+pip install --quiet numpy scipy requests pystray Pillow
 
 if %HAS_CUDA%==1 (
     echo   Installing CUDA support...
     pip install --quiet cupy-cuda12x 2>nul || pip install --quiet cupy-cuda11x 2>nul || echo   CuPy unavailable - using CPU
 )
 
+:: Optional screensaver deps (non-fatal if they fail)
+pip install --quiet pygame moderngl pyrr 2>nul
+if %errorlevel%==0 (
+    echo   [OK] Screensaver support installed
+) else (
+    echo   [--] Screensaver deps unavailable (optional)
+)
+
 echo   [OK] Dependencies installed
 echo.
 
 :: ═══════════════════════════════════════════════
-:: Setup Wizard
+:: Create Launchers
 :: ═══════════════════════════════════════════════
-echo  ════════════════════════════════════════════════
-echo    Setup Wizard
-echo  ════════════════════════════════════════════════
-echo.
 
-:: Name
-set DEFAULT_NAME=%COMPUTERNAME%-%USERNAME%
-set /p NODE_NAME="  Node name [%DEFAULT_NAME%]: "
-if "!NODE_NAME!"=="" set NODE_NAME=%DEFAULT_NAME%
-echo   [OK] Name: !NODE_NAME!
-echo.
-
-:: Server
-set DEFAULT_SERVER=https://wathome.akataleptos.com
-set /p HIVE_SERVER="  Hive server [%DEFAULT_SERVER%]: "
-if "!HIVE_SERVER!"=="" set HIVE_SERVER=%DEFAULT_SERVER%
-echo   [OK] Server: !HIVE_SERVER!
-echo.
-
-:: ═══════════════════════════════════════════════
-:: Create Launcher
-:: ═══════════════════════════════════════════════
+:: GUI launcher (default)
 (
 echo @echo off
 echo cd /d "%INSTALL_DIR%"
 echo call venv\Scripts\activate.bat
-echo python client.py --server "!HIVE_SERVER!" --name "!NODE_NAME!" %%*
+echo pythonw whome_gui.py %%*
 ) > "%INSTALL_DIR%\whome.bat"
+
+:: CLI launcher (fallback)
+(
+echo @echo off
+echo cd /d "%INSTALL_DIR%"
+echo call venv\Scripts\activate.bat
+echo python client.py %%*
+) > "%INSTALL_DIR%\whome-cli.bat"
 
 :: Desktop shortcut
 set SHORTCUT=%USERPROFILE%\Desktop\W@Home.bat
 copy /y "%INSTALL_DIR%\whome.bat" "%SHORTCUT%" >nul 2>nul
 if %errorlevel%==0 echo   [OK] Desktop shortcut created
 
+:: Start Menu shortcut
+set STARTMENU=%APPDATA%\Microsoft\Windows\Start Menu\Programs
+copy /y "%INSTALL_DIR%\whome.bat" "%STARTMENU%\W@Home Hive.bat" >nul 2>nul
+if %errorlevel%==0 echo   [OK] Start Menu shortcut created
+
 echo.
 echo  ╔══════════════════════════════════════════════════════════╗
 echo  ║  Installation Complete!                                  ║
 echo  ╚══════════════════════════════════════════════════════════╝
 echo.
-echo   Start computing:    "%INSTALL_DIR%\whome.bat"
-echo   Or double-click:    W@Home on Desktop
-echo   Uninstall:          rmdir /s "%INSTALL_DIR%"
+echo   Launch GUI:          "%INSTALL_DIR%\whome.bat"
+echo   CLI mode:            "%INSTALL_DIR%\whome-cli.bat"
+echo   Or double-click:     W@Home on Desktop
+echo   Uninstall:           rmdir /s "%INSTALL_DIR%"
 echo.
 
-set /p START="  Start computing now? [Y/n]: "
+set /p START="  Launch W@Home now? [Y/n]: "
 if /i "!START!"=="n" (
     echo   Run whome.bat whenever you're ready.
 ) else (
-    call "%INSTALL_DIR%\whome.bat"
+    start "" "%INSTALL_DIR%\whome.bat"
 )
 
 pause

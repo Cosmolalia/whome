@@ -229,17 +229,52 @@ COL = {
 
 LEVEL_ALPHA = {0: 0.8, 1: 0.5, 2: 0.2, 3: 0.06}
 
+def _get_native_resolution():
+    """Get native (unscaled) screen resolution on Windows with DPI scaling."""
+    try:
+        import ctypes
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PER_MONITOR_DPI_AWARE
+    except Exception:
+        try:
+            import ctypes
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
+    pygame.init()
+    info = pygame.display.Info()
+    return info.current_w, info.current_h
+
+
+def _read_status_file():
+    """Read compute_status.json from shared location (file-based IPC with GUI)."""
+    if sys.platform == 'win32':
+        shared = os.path.join(os.environ.get('LOCALAPPDATA', ''), 'WHome')
+    else:
+        shared = os.path.join(os.path.expanduser('~'), '.whome')
+    path = os.path.join(shared, 'compute_status.json')
+    try:
+        if os.path.exists(path) and time.time() - os.path.getmtime(path) < 30:
+            with open(path) as f:
+                data = json.load(f)
+            if data.get('active'):
+                return data
+    except Exception:
+        pass
+    return None
+
+
 def run_screensaver(api_key=None, server_url="http://localhost:8081",
                     worker_id=None, compute_state=None, fullscreen=False):
     """Main screensaver loop."""
-    pygame.init()
+    if fullscreen:
+        W, H = _get_native_resolution()
+    else:
+        pygame.init()
+        W, H = 1600, 900
+
     flags = pygame.OPENGL | pygame.DOUBLEBUF
     if fullscreen:
         flags |= pygame.FULLSCREEN
-        info = pygame.display.Info()
-        W, H = info.current_w, info.current_h
-    else:
-        W, H = 1600, 900
 
     pygame.display.set_caption("W@Home — Akataleptos Spectral Search")
     screen = pygame.display.set_mode((W, H), flags)
@@ -280,7 +315,7 @@ def run_screensaver(api_key=None, server_url="http://localhost:8081",
     ])
 
     # Fonts
-    mono = 'monospace'
+    mono = 'Menlo' if sys.platform == 'darwin' else 'monospace'
     fonts = {
         'title':  pygame.font.SysFont(mono, 28, bold=True),
         'sub':    pygame.font.SysFont(mono, 18),
@@ -395,8 +430,8 @@ def run_screensaver(api_key=None, server_url="http://localhost:8081",
             s = fonts['info'].render(stats, True, (80, 80, 100))
             hud.blit(s, (30, stats_y))
 
-        # Current computation (if worker is running)
-        comp = compute_state.get() if compute_state else None
+        # Current computation (if worker is running, or via file IPC)
+        comp = compute_state.get() if compute_state else _read_status_file()
         if comp and comp.get('lambda_val') is not None:
             # Lambda value — big display
             lam_str = f"λ = {comp['lambda_val']:.6f}"

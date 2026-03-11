@@ -3,6 +3,7 @@ __pycache__/
 venv/
 hive.db
 worker_config.json
+worker_config.json.bak
 checkpoint.json
 canaries.json
 discoveries.log
@@ -10,3 +11,9 @@ discoveries.log
 .env
 pyodide/
 hive_server.log
+receipts.jsonl
+*.exe
+*.bak
+android/.buildozer/
+android/bin/
+android/build.log
