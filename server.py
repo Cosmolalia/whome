@@ -200,6 +200,48 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_assignments_job ON assignments(job_id);
         CREATE INDEX IF NOT EXISTS idx_results_job ON results(job_id);
         CREATE INDEX IF NOT EXISTS idx_messages_sent ON messages(sent_at);
+
+        CREATE TABLE IF NOT EXISTS hints (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            worker_id TEXT NOT NULL,
+            hint_type TEXT NOT NULL,
+            lambda_center REAL,
+            lambda_width REAL,
+            confidence REAL DEFAULT 0.0,
+            constants_involved TEXT DEFAULT '[]',
+            observation TEXT DEFAULT '',
+            requested_resolution REAL,
+            created_at REAL NOT NULL,
+            status TEXT DEFAULT 'active',
+            jobs_created INTEGER DEFAULT 0,
+            FOREIGN KEY (worker_id) REFERENCES workers(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_hints_created ON hints(created_at);
+
+        CREATE TABLE IF NOT EXISTS hypotheses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            worker_id TEXT NOT NULL,
+            hypothesis TEXT NOT NULL,
+            test_lambdas TEXT DEFAULT '[]',
+            prediction TEXT DEFAULT '',
+            falsifiable INTEGER DEFAULT 1,
+            status TEXT DEFAULT 'pending',
+            result_summary TEXT DEFAULT '',
+            created_at REAL NOT NULL,
+            resolved_at REAL,
+            FOREIGN KEY (worker_id) REFERENCES workers(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_hypotheses_status ON hypotheses(status);
+
+        CREATE TABLE IF NOT EXISTS observations (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            worker_id TEXT NOT NULL,
+            worker_name TEXT DEFAULT '',
+            content TEXT NOT NULL,
+            created_at REAL NOT NULL,
+            FOREIGN KEY (worker_id) REFERENCES workers(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_observations_created ON observations(created_at);
     """)
     conn.commit()
 
@@ -225,6 +267,20 @@ def init_db():
         conn.execute("SELECT param_tier FROM discoveries LIMIT 1")
     except sqlite3.OperationalError:
         conn.execute("ALTER TABLE discoveries ADD COLUMN param_tier TEXT DEFAULT 'desktop'")
+        conn.commit()
+
+    # Agent mode migrations
+    try:
+        conn.execute("SELECT worker_type FROM workers LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE workers ADD COLUMN worker_type TEXT DEFAULT 'human'")
+        conn.commit()
+    try:
+        conn.execute("SELECT priority FROM jobs LIMIT 1")
+    except sqlite3.OperationalError:
+        conn.execute("ALTER TABLE jobs ADD COLUMN priority INTEGER DEFAULT 0")
+        conn.execute("ALTER TABLE jobs ADD COLUMN source_hint_id INTEGER DEFAULT NULL")
+        conn.execute("ALTER TABLE jobs ADD COLUMN source_hypothesis_id INTEGER DEFAULT NULL")
         conn.commit()
 
     conn.close()
@@ -469,6 +525,9 @@ RATE_LIMITS = {
     "login": (10, 600),        # 10 login attempts per 10 min
     "job": (120, 60),          # 120 job requests per minute (2/s burst OK)
     "result": (120, 60),       # same
+    "hint": (30, 60),          # 30 hints per minute
+    "hypothesis": (10, 60),    # 10 hypotheses per minute
+    "observe": (20, 60),       # 20 observations per minute
 }
 
 def _check_rate(ip: str, endpoint: str):
@@ -719,6 +778,8 @@ class RegisterRequest(BaseModel):
     gpu_info: str = ""
     password: str = ""
     device_name: str = ""
+    worker_type: str = "human"
+    capabilities: List[str] = []
 
 @app.post("/register")
 def register_worker(req: RegisterRequest, request: Request):
@@ -763,10 +824,11 @@ def register_worker(req: RegisterRequest, request: Request):
     api_key = secrets.token_urlsafe(32)
     now = time.time()
     pw_hash = hash_password(req.password)
+    wtype = req.worker_type if req.worker_type in ('human', 'agent') else 'human'
 
     conn.execute(
-        "INSERT INTO workers (id, api_key_hash, password_hash, name, registered_at, last_heartbeat, gpu_info) VALUES (?,?,?,?,?,?,?)",
-        (worker_id, hash_key(api_key), pw_hash, req.name, now, now, req.gpu_info)
+        "INSERT INTO workers (id, api_key_hash, password_hash, name, registered_at, last_heartbeat, gpu_info, worker_type) VALUES (?,?,?,?,?,?,?,?)",
+        (worker_id, hash_key(api_key), pw_hash, req.name, now, now, req.gpu_info, wtype)
     )
     # Also insert into api_keys table for the new multi-device flow
     conn.execute(
@@ -780,6 +842,7 @@ def register_worker(req: RegisterRequest, request: Request):
     return {
         "worker_id": worker_id,
         "api_key": api_key,
+        "worker_type": wtype,
         "message": "Welcome to the Hive. Your account is secured with your password."
     }
 
@@ -938,7 +1001,17 @@ def get_job(request: Request, x_api_key: str = Header(), x_device_type: str = He
         if spot:
             job = spot
 
-    # If no canary selected, find a real pending job
+    # Priority queue: check for agent-mode priority jobs before normal sweep
+    if not job:
+        job = conn.execute(f"""
+            SELECT j.id, j.lambda_val FROM jobs j
+            WHERE j.status = 'pending' AND j.priority > 0
+            AND j.id NOT IN ({exclude_sql})
+            ORDER BY j.priority DESC, j.id ASC
+            LIMIT 1
+        """, same_ip_workers).fetchone()
+
+    # If no priority job, find a real pending job (normal sweep)
     if not job:
         job = conn.execute(f"""
             SELECT j.id, j.lambda_val FROM jobs j
@@ -953,6 +1026,7 @@ def get_job(request: Request, x_api_key: str = Header(), x_device_type: str = He
         job = conn.execute(f"""
             SELECT j.id, j.lambda_val FROM jobs j
             WHERE j.status = 'pending' AND j.is_canary = 0
+            AND j.priority = 0
             AND j.id NOT IN ({exclude_sql})
             ORDER BY j.id ASC
             LIMIT 1
@@ -994,6 +1068,38 @@ def get_job(request: Request, x_api_key: str = Header(), x_device_type: str = He
     }
 
 # ── Result Submission ──
+
+def _check_hypothesis_resolution(hyp_id: int, conn):
+    """Check if all test jobs for a hypothesis are done. If so, resolve it."""
+    hyp = conn.execute("SELECT * FROM hypotheses WHERE id = ? AND status = 'pending'", (hyp_id,)).fetchone()
+    if not hyp:
+        return
+    # Find all jobs linked to this hypothesis
+    test_jobs = conn.execute(
+        "SELECT j.id, j.status, j.quorum_received FROM jobs j WHERE j.source_hypothesis_id = ?",
+        (hyp_id,)
+    ).fetchall()
+    if not test_jobs:
+        return
+    # Check if all are completed
+    all_done = all(j['quorum_received'] > 0 for j in test_jobs)
+    if not all_done:
+        return
+    # Check if any hits were found
+    hits = []
+    for j in test_jobs:
+        discoveries = conn.execute(
+            "SELECT constant_name FROM discoveries WHERE job_id = ?", (j['id'],)
+        ).fetchall()
+        hits.extend([d['constant_name'] for d in discoveries])
+    status = 'confirmed' if hits else 'refuted'
+    summary = f"{'|'.join(hits)}" if hits else "No hits found at any test lambda"
+    conn.execute(
+        "UPDATE hypotheses SET status = ?, result_summary = ?, resolved_at = ? WHERE id = ?",
+        (status, summary, time.time(), hyp_id)
+    )
+    conn.commit()
+
 
 class ResultSubmit(BaseModel):
     job_id: int
@@ -1097,6 +1203,14 @@ def submit_result(result: ResultSubmit, request: Request, x_api_key: str = Heade
         conn.execute("UPDATE jobs SET status = 'completed' WHERE id = ?", (result.job_id,))
         conn.commit()
 
+    # Check if this result resolves a hypothesis
+    hyp_link = conn.execute(
+        "SELECT source_hypothesis_id FROM jobs WHERE id = ? AND source_hypothesis_id IS NOT NULL",
+        (result.job_id,)
+    ).fetchone()
+    if hyp_link and hyp_link['source_hypothesis_id']:
+        _check_hypothesis_resolution(hyp_link['source_hypothesis_id'], conn)
+
     # Build signed receipt
     receipt = make_receipt(
         job_id=result.job_id,
@@ -1179,6 +1293,20 @@ def _get_progress_stats(conn) -> dict:
     pct = (completed / total * 100) if total > 0 else 0
     eta_hours = ((total - completed) / recent_completions) if recent_completions > 0 else float('inf')
 
+    # Agent mode stats (safe — tables exist after init_db)
+    try:
+        total_hints = conn.execute("SELECT COUNT(*) FROM hints").fetchone()[0]
+        total_hypotheses = conn.execute("SELECT COUNT(*) FROM hypotheses").fetchone()[0]
+        hypotheses_confirmed = conn.execute("SELECT COUNT(*) FROM hypotheses WHERE status = 'confirmed'").fetchone()[0]
+        hypotheses_refuted = conn.execute("SELECT COUNT(*) FROM hypotheses WHERE status = 'refuted'").fetchone()[0]
+        priority_jobs = conn.execute("SELECT COUNT(*) FROM jobs WHERE priority > 0").fetchone()[0]
+        active_agents = conn.execute(
+            "SELECT COUNT(*) FROM workers WHERE worker_type = 'agent' AND last_heartbeat > ? AND status = 'active'",
+            (time.time() - 300,)
+        ).fetchone()[0]
+    except sqlite3.OperationalError:
+        total_hints = total_hypotheses = hypotheses_confirmed = hypotheses_refuted = priority_jobs = active_agents = 0
+
     return {
         "total_jobs": total,
         "completed": completed,
@@ -1188,9 +1316,15 @@ def _get_progress_stats(conn) -> dict:
         "disputed": disputed,
         "percent_complete": round(pct, 4),
         "active_workers": active_workers,
+        "active_agents": active_agents,
         "total_compute_hours": round(total_compute / 3600, 2),
         "total_discoveries": total_discoveries,
         "total_confirmed": total_confirmed,
+        "total_hints": total_hints,
+        "total_hypotheses": total_hypotheses,
+        "hypotheses_confirmed": hypotheses_confirmed,
+        "hypotheses_refuted": hypotheses_refuted,
+        "priority_jobs": priority_jobs,
         "current_lambda": round(current_lam, 6),
         "jobs_per_hour": recent_completions,
         "eta_hours": round(eta_hours, 1) if eta_hours != float('inf') else None,
@@ -1564,6 +1698,213 @@ def admin_revoke_keys(worker_id: str, x_admin_key: str = Header(default="")):
     conn.commit()
     conn.close()
     return {"status": "keys_revoked", "worker_id": worker_id}
+
+# ═══════════════════════════════════════════════════════════
+# Agent Mode — Smart Tier Endpoints
+# ═══════════════════════════════════════════════════════════
+
+PRIORITY_JOB_BASE = TOTAL_JOBS + 100000  # IDs for agent-generated jobs
+
+class HintSubmit(BaseModel):
+    hint_type: str
+    lambda_center: float = 0.0
+    lambda_width: float = 0.0
+    confidence: float = 0.0
+    constants_involved: List[str] = []
+    observation: str = ""
+    requested_resolution: float = 0.0
+
+@app.post("/api/hint")
+def submit_hint(hint: HintSubmit, request: Request, x_api_key: str = Header()):
+    """Submit adaptive sampling hint. Creates priority jobs in hinted region."""
+    ip = _get_client_ip(request)
+    _check_rate(ip, "hint")
+    conn = get_db()
+    if _is_banned(conn, ip):
+        conn.close()
+        raise HTTPException(403, "Access denied")
+    worker = verify_worker(x_api_key, conn)
+    if not worker:
+        conn.close()
+        raise HTTPException(401, "Invalid API key")
+
+    now = time.time()
+    conn.execute(
+        "INSERT INTO hints (worker_id, hint_type, lambda_center, lambda_width, confidence, constants_involved, observation, requested_resolution, created_at) VALUES (?,?,?,?,?,?,?,?,?)",
+        (worker['id'], hint.hint_type, hint.lambda_center, hint.lambda_width,
+         hint.confidence, json.dumps(hint.constants_involved), hint.observation,
+         hint.requested_resolution, now)
+    )
+    hint_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+    # Generate priority jobs in hinted lambda region
+    jobs_created = 0
+    if hint.lambda_center > 0 and hint.lambda_width > 0:
+        resolution = hint.requested_resolution if hint.requested_resolution > 0 else LAMBDA_STEP
+        lam_start = hint.lambda_center - hint.lambda_width / 2
+        lam_end = hint.lambda_center + hint.lambda_width / 2
+        max_jobs = 100  # cap per hint
+        lam = lam_start
+        # Find next available ID
+        max_id = conn.execute("SELECT COALESCE(MAX(id), ?) FROM jobs WHERE id >= ?",
+                              (PRIORITY_JOB_BASE - 1, PRIORITY_JOB_BASE)).fetchone()[0]
+        next_id = max(max_id + 1, PRIORITY_JOB_BASE)
+
+        while lam <= lam_end and jobs_created < max_jobs:
+            # Check if a job already exists near this lambda
+            existing = conn.execute(
+                "SELECT id FROM jobs WHERE ABS(lambda_val - ?) < ?",
+                (lam, resolution / 2)
+            ).fetchone()
+            if not existing:
+                conn.execute(
+                    "INSERT OR IGNORE INTO jobs (id, lambda_val, status, quorum_target, quorum_received, verified, created_at, priority, source_hint_id) VALUES (?,?,?,?,?,?,?,?,?)",
+                    (next_id, round(lam, 10), 'pending', QUORUM_SIZE, 0, 0, now, 1, hint_id)
+                )
+                next_id += 1
+                jobs_created += 1
+            lam += resolution
+
+    conn.execute("UPDATE hints SET jobs_created = ? WHERE id = ?", (jobs_created, hint_id))
+    conn.commit()
+    conn.close()
+
+    return {"status": "accepted", "hint_id": hint_id, "jobs_created": jobs_created}
+
+
+class HypothesisSubmit(BaseModel):
+    hypothesis: str
+    test_lambdas: List[float] = []
+    prediction: str = ""
+    falsifiable: bool = True
+
+@app.post("/api/hypothesis")
+def submit_hypothesis(hyp: HypothesisSubmit, request: Request, x_api_key: str = Header()):
+    """Submit testable hypothesis. Creates highest-priority jobs for test lambdas."""
+    ip = _get_client_ip(request)
+    _check_rate(ip, "hypothesis")
+    conn = get_db()
+    if _is_banned(conn, ip):
+        conn.close()
+        raise HTTPException(403, "Access denied")
+    worker = verify_worker(x_api_key, conn)
+    if not worker:
+        conn.close()
+        raise HTTPException(401, "Invalid API key")
+
+    now = time.time()
+    conn.execute(
+        "INSERT INTO hypotheses (worker_id, hypothesis, test_lambdas, prediction, falsifiable, created_at) VALUES (?,?,?,?,?,?)",
+        (worker['id'], hyp.hypothesis, json.dumps(hyp.test_lambdas),
+         hyp.prediction, 1 if hyp.falsifiable else 0, now)
+    )
+    hyp_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+    # Create priority-2 jobs for each test lambda
+    jobs_created = 0
+    jobs_existing = 0
+    max_id = conn.execute("SELECT COALESCE(MAX(id), ?) FROM jobs WHERE id >= ?",
+                          (PRIORITY_JOB_BASE - 1, PRIORITY_JOB_BASE)).fetchone()[0]
+    next_id = max(max_id + 1, PRIORITY_JOB_BASE)
+
+    for lam in hyp.test_lambdas[:20]:  # cap at 20 test lambdas per hypothesis
+        existing = conn.execute(
+            "SELECT id FROM jobs WHERE ABS(lambda_val - ?) < ?",
+            (lam, LAMBDA_STEP / 2)
+        ).fetchone()
+        if existing:
+            jobs_existing += 1
+        else:
+            conn.execute(
+                "INSERT OR IGNORE INTO jobs (id, lambda_val, status, quorum_target, quorum_received, verified, created_at, priority, source_hypothesis_id) VALUES (?,?,?,?,?,?,?,?,?)",
+                (next_id, round(lam, 10), 'pending', QUORUM_SIZE, 0, 0, now, 2, hyp_id)
+            )
+            next_id += 1
+            jobs_created += 1
+
+    conn.commit()
+    conn.close()
+
+    return {"status": "accepted", "hypothesis_id": hyp_id, "jobs_created": jobs_created, "jobs_existing": jobs_existing}
+
+
+class ObservationSubmit(BaseModel):
+    text: str
+
+@app.post("/api/observe")
+def submit_observation(obs: ObservationSubmit, request: Request, x_api_key: str = Header()):
+    """Write to the shared observation blackboard."""
+    ip = _get_client_ip(request)
+    _check_rate(ip, "observe")
+    conn = get_db()
+    if _is_banned(conn, ip):
+        conn.close()
+        raise HTTPException(403, "Access denied")
+    worker = verify_worker(x_api_key, conn)
+    if not worker:
+        conn.close()
+        raise HTTPException(401, "Invalid API key")
+
+    text = obs.text[:2000]  # cap length
+    now = time.time()
+    conn.execute(
+        "INSERT INTO observations (worker_id, worker_name, content, created_at) VALUES (?,?,?,?)",
+        (worker['id'], worker.get('name', ''), text, now)
+    )
+    obs_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    conn.commit()
+    conn.close()
+
+    return {"status": "logged", "observation_id": obs_id}
+
+
+@app.get("/api/hints")
+def list_hints(limit: int = 50, status: str = ""):
+    """List recent hints (public)."""
+    conn = get_db()
+    if status:
+        rows = conn.execute(
+            "SELECT h.*, w.name as worker_name FROM hints h LEFT JOIN workers w ON h.worker_id = w.id WHERE h.status = ? ORDER BY h.created_at DESC LIMIT ?",
+            (status, limit)
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT h.*, w.name as worker_name FROM hints h LEFT JOIN workers w ON h.worker_id = w.id ORDER BY h.created_at DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+@app.get("/api/hypotheses")
+def list_hypotheses(limit: int = 50, status: str = ""):
+    """List hypotheses and their status (public)."""
+    conn = get_db()
+    if status:
+        rows = conn.execute(
+            "SELECT h.*, w.name as worker_name FROM hypotheses h LEFT JOIN workers w ON h.worker_id = w.id WHERE h.status = ? ORDER BY h.created_at DESC LIMIT ?",
+            (status, limit)
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT h.*, w.name as worker_name FROM hypotheses h LEFT JOIN workers w ON h.worker_id = w.id ORDER BY h.created_at DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+@app.get("/api/observations")
+def list_observations(limit: int = 100, since: float = 0):
+    """Read the shared observation blackboard."""
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM observations WHERE created_at > ? ORDER BY created_at DESC LIMIT ?",
+        (since, limit)
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
 
 # ── Dashboard ──
 
