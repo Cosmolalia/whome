@@ -16,7 +16,7 @@ source.dir = .
 source.include_exts = py,png,jpg,kv,atlas,json
 
 # (str) Application versioning
-version = 0.2.2
+version = 1.0.1
 
 # (list) Application requirements
 # scipy removed — requires legacy NDK r21e with gfortran for LAPACK cross-compilation.
@@ -29,7 +29,7 @@ requirements = python3,kivy,numpy,pillow,pyjnius
 #presplash.filename = %(source.dir)s/data/presplash.png
 
 # (str) Icon of the application
-#icon.filename = %(source.dir)s/data/icon.png
+icon.filename = %(source.dir)s/icon-512.png
 
 # (str) Supported orientation (one of landscape, sensorLandscape, portrait or all)
 orientation = portrait

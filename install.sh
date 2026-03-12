@@ -224,27 +224,42 @@ say "  ${BOLD}Setup Wizard${RESET}"
 say "${CYAN}════════════════════════════════════════════════${RESET}"
 say ""
 
-# Name
 DEFAULT_NAME="$(hostname)-$(whoami)"
-read -p "  Node name [$DEFAULT_NAME]: " NODE_NAME < /dev/tty
-NODE_NAME="${NODE_NAME:-$DEFAULT_NAME}"
-say "  ${GREEN}✓${RESET} Name: $NODE_NAME"
-say ""
-
-# Server
 DEFAULT_SERVER="https://wathome.akataleptos.com"
-read -p "  Hive server [$DEFAULT_SERVER]: " SERVER < /dev/tty
-SERVER="${SERVER:-$DEFAULT_SERVER}"
-say "  ${GREEN}✓${RESET} Server: $SERVER"
-say ""
-
-# Autostart
 SETUP_AUTOSTART=false
-read -p "  Start on login? [y/N] " yn < /dev/tty
-case $yn in
-    [Yy]* ) SETUP_AUTOSTART=true; say "  ${GREEN}✓${RESET} Autostart: yes";;
-    * ) say "  ${DIM}○${RESET} Autostart: no";;
-esac
+
+# Check if we have a terminal for interactive prompts
+TTY_OK=false
+if (echo < /dev/tty) >/dev/null 2>&1; then
+    TTY_OK=true
+fi
+
+if [ "$TTY_OK" = true ]; then
+    # Interactive — ask questions
+    read -p "  Node name [$DEFAULT_NAME]: " NODE_NAME < /dev/tty
+    NODE_NAME="${NODE_NAME:-$DEFAULT_NAME}"
+    say "  ${GREEN}✓${RESET} Name: $NODE_NAME"
+    say ""
+
+    read -p "  Hive server [$DEFAULT_SERVER]: " SERVER < /dev/tty
+    SERVER="${SERVER:-$DEFAULT_SERVER}"
+    say "  ${GREEN}✓${RESET} Server: $SERVER"
+    say ""
+
+    read -p "  Start on login? [y/N] " yn < /dev/tty
+    case $yn in
+        [Yy]* ) SETUP_AUTOSTART=true; say "  ${GREEN}✓${RESET} Autostart: yes";;
+        * ) say "  ${DIM}○${RESET} Autostart: no";;
+    esac
+else
+    # Non-interactive — use defaults
+    say "  ${DIM}(non-interactive — using defaults)${RESET}"
+    NODE_NAME="$DEFAULT_NAME"
+    SERVER="$DEFAULT_SERVER"
+    say "  ${GREEN}✓${RESET} Name: $NODE_NAME"
+    say "  ${GREEN}✓${RESET} Server: $SERVER"
+    say "  ${DIM}○${RESET} Autostart: no (run whome-gui to configure)"
+fi
 say ""
 
 # ═══════════════════════════════════════════════
@@ -261,16 +276,14 @@ chmod +x "$INSTALL_DIR/whome"
 cat > "$INSTALL_DIR/whome-gui" << LAUNCHER
 #!/bin/bash
 cd "$INSTALL_DIR"
-source venv/bin/activate
-exec python3 whome_gui.py "\$@"
+exec "$INSTALL_DIR/venv/bin/python3" "$INSTALL_DIR/whome_gui.py" "\$@"
 LAUNCHER
 chmod +x "$INSTALL_DIR/whome-gui"
 
 cat > "$INSTALL_DIR/whome-screensaver" << LAUNCHER
 #!/bin/bash
 cd "$INSTALL_DIR"
-source venv/bin/activate
-exec python3 screensaver.py "\$@"
+exec "$INSTALL_DIR/venv/bin/python3" "$INSTALL_DIR/screensaver.py" "\$@"
 LAUNCHER
 chmod +x "$INSTALL_DIR/whome-screensaver"
 
@@ -312,11 +325,13 @@ Name=W@Home Hive
 Comment=Akataleptos Distributed Spectral Search
 Exec=$INSTALL_DIR/whome-gui
 Icon=$INSTALL_DIR/icon-menger-256.png
+StartupWMClass=whome
 Terminal=false
 Categories=Science;Math;
 Keywords=compute;distributed;eigenvalue;
 DESKTOP
     chmod +x "$APPS_DIR/whome.desktop"
+    update-desktop-database "$APPS_DIR" 2>/dev/null || true
     say "  ${GREEN}✓${RESET} Added to application menu"
 elif [ "$OS" == "macos" ]; then
     BUNDLE="$HOME/Applications/W@Home Hive.app"
@@ -326,8 +341,7 @@ elif [ "$OS" == "macos" ]; then
     cat > "$BUNDLE/Contents/MacOS/W@Home Hive" << MACAPP
 #!/bin/bash
 cd "$INSTALL_DIR"
-source venv/bin/activate
-exec python3 whome_gui.py "\$@"
+exec "$INSTALL_DIR/venv/bin/python3" "$INSTALL_DIR/whome_gui.py" "\$@" 2>"$INSTALL_DIR/gui_error.log"
 MACAPP
     chmod +x "$BUNDLE/Contents/MacOS/W@Home Hive"
     cat > "$BUNDLE/Contents/Info.plist" << PLIST
@@ -421,8 +435,12 @@ elif [ "$OS" == "macos" ]; then
 fi
 say ""
 
-read -p "  Launch W@Home now? [Y/n] " yn < /dev/tty
-case $yn in
-    [Nn]* ) say "  Run ${CYAN}whome-gui${RESET} whenever you're ready.";;
-    * ) exec "$INSTALL_DIR/whome-gui";;
-esac
+if [ "$TTY_OK" = true ]; then
+    read -p "  Launch W@Home now? [Y/n] " yn < /dev/tty
+    case $yn in
+        [Nn]* ) say "  Run ${CYAN}whome-gui${RESET} whenever you're ready.";;
+        * ) exec "$INSTALL_DIR/whome-gui";;
+    esac
+else
+    say "  Run ${CYAN}whome-gui${RESET} to launch."
+fi

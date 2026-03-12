@@ -8,22 +8,34 @@ Dependencies: tkinter (built-in), requests, numpy, scipy
 Optional: pystray + Pillow (system tray), pygame + moderngl (screensaver)
 """
 
+import os
+import sys
+
 import tkinter as tk
 from tkinter import ttk, messagebox
 import threading
 import queue
 import json
 import hashlib
-import os
-import sys
 import time
 import platform
 import subprocess
 
 # Ensure local imports work
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
-if APP_DIR not in sys.path:
-    sys.path.insert(0, APP_DIR)
+if getattr(sys, 'frozen', False):
+    # Frozen exe — config goes in %LOCALAPPDATA%\WHome (persistent)
+    # Code/imports come from the temp extraction dir
+    _CODE_DIR = getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
+    APP_DIR = os.path.join(
+        os.environ.get('LOCALAPPDATA', os.path.dirname(sys.executable)),
+        'WHome'
+    )
+    os.makedirs(APP_DIR, exist_ok=True)
+else:
+    _CODE_DIR = os.path.dirname(os.path.abspath(__file__))
+    APP_DIR = _CODE_DIR
+if _CODE_DIR not in sys.path:
+    sys.path.insert(0, _CODE_DIR)
 
 import requests
 import numpy as np
@@ -51,7 +63,11 @@ try:
 except ImportError:
     HAS_TRAY = False
 
-HAS_SCREENSAVER = os.path.exists(os.path.join(APP_DIR, 'screensaver.py'))
+# Screensaver: always available when frozen (same exe), check .py when from source
+if getattr(sys, 'frozen', False):
+    HAS_SCREENSAVER = True
+else:
+    HAS_SCREENSAVER = os.path.exists(os.path.join(APP_DIR, 'screensaver.py'))
 
 import webbrowser
 
@@ -59,7 +75,7 @@ import webbrowser
 # Constants
 # ═══════════════════════════════════════════════════════════
 
-VERSION = "1.0.0"
+VERSION = "1.0.2"
 DEFAULT_SERVER = "https://wathome.akataleptos.com"
 CONFIG_PATH = os.path.join(APP_DIR, "worker_config.json")
 CHECKPOINT_PATH = os.path.join(APP_DIR, "checkpoint.json")
@@ -79,6 +95,7 @@ C = {
     'green': '#80ffaa', 'red': '#ff6666',
     'btn': '#2a3a5a', 'btn_active': '#3a4a7a',
 }
+MONO = 'Menlo' if sys.platform == 'darwin' else 'Consolas'
 
 # ═══════════════════════════════════════════════════════════
 # Config helpers
@@ -107,6 +124,89 @@ def load_checkpoint():
 def clear_checkpoint():
     if os.path.exists(CHECKPOINT_PATH):
         os.remove(CHECKPOINT_PATH)
+
+def _set_boot_autostart(enable):
+    """Register/unregister app to start on boot (platform-specific)."""
+    try:
+        if sys.platform == 'win32':
+            import winreg
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                r"Software\Microsoft\Windows\CurrentVersion\Run",
+                                0, winreg.KEY_SET_VALUE)
+            if enable:
+                # Use the exe path if frozen, otherwise python + script
+                if getattr(sys, 'frozen', False):
+                    winreg.SetValueEx(key, "WHome", 0, winreg.REG_SZ, sys.executable)
+                else:
+                    winreg.SetValueEx(key, "WHome", 0, winreg.REG_SZ,
+                                      f'"{sys.executable}" "{os.path.abspath(__file__)}"')
+            else:
+                try:
+                    winreg.DeleteValue(key, "WHome")
+                except FileNotFoundError:
+                    pass
+            winreg.CloseKey(key)
+        elif sys.platform == 'linux':
+            desktop_path = os.path.expanduser('~/.config/autostart/whome.desktop')
+            if enable:
+                os.makedirs(os.path.dirname(desktop_path), exist_ok=True)
+                exe = os.path.join(os.path.expanduser('~'), '.whome', 'whome-gui')
+                icon = os.path.join(os.path.expanduser('~'), '.whome', 'icon-menger-256.png')
+                with open(desktop_path, 'w') as f:
+                    f.write(f"[Desktop Entry]\nType=Application\nName=W@Home Hive\n"
+                            f"Comment=Akataleptos Distributed Spectral Search\n"
+                            f"Exec={exe}\nIcon={icon}\nTerminal=false\n"
+                            f"Hidden=false\nX-GNOME-Autostart-enabled=true\n")
+            else:
+                if os.path.exists(desktop_path):
+                    os.remove(desktop_path)
+    except Exception:
+        pass
+
+# ═══════════════════════════════════════════════════════════
+# Thermal protection
+# ═══════════════════════════════════════════════════════════
+
+THERMAL_PAUSE = 85   # pause computation above this °C
+THERMAL_RESUME = 75  # resume when cooled to this °C
+
+def get_cpu_temp():
+    """Get current CPU temperature in °C. Cross-platform."""
+    try:
+        if sys.platform == 'linux':
+            # Read all thermal zones, return the hottest
+            best = 0
+            for i in range(20):
+                try:
+                    with open(f'/sys/class/thermal/thermal_zone{i}/temp') as f:
+                        t = int(f.read().strip()) / 1000
+                        if t > best:
+                            best = t
+                except (FileNotFoundError, ValueError):
+                    break
+            return best if best > 0 else None
+        elif sys.platform == 'win32':
+            # WMI temperature query
+            import subprocess
+            r = subprocess.run(
+                ['powershell', '-Command',
+                 'Get-CimInstance MSAcpi_ThermalZoneTemperature -Namespace root/wmi 2>$null | '
+                 'Select-Object -ExpandProperty CurrentTemperature | Sort-Object -Descending | '
+                 'Select-Object -First 1'],
+                capture_output=True, text=True, timeout=5)
+            if r.returncode == 0 and r.stdout.strip():
+                # WMI returns deciKelvin
+                return (int(r.stdout.strip()) / 10) - 273.15
+            return None
+        elif sys.platform == 'darwin':
+            # macOS — try osx-cpu-temp if installed
+            import subprocess
+            r = subprocess.run(['osx-cpu-temp'], capture_output=True, text=True, timeout=5)
+            if r.returncode == 0:
+                return float(r.stdout.strip().replace('°C', ''))
+            return None
+    except Exception:
+        return None
 
 # ═══════════════════════════════════════════════════════════
 # Network helpers
@@ -186,8 +286,8 @@ def do_login(server, name, password):
 # Tray icon
 # ═══════════════════════════════════════════════════════════
 
-def create_tray_icon(state='idle'):
-    """Create a 64x64 Menger-pattern tray icon."""
+def create_tray_icon(state='idle', alert=False):
+    """Create a 64x64 Menger-pattern tray icon. Gold dot overlay if alert=True."""
     if not HAS_TRAY:
         return None
     img = Image.new('RGBA', (64, 64), (0, 0, 0, 0))
@@ -202,6 +302,10 @@ def create_tray_icon(state='idle'):
                 continue
             draw.rectangle([2 + x*s, 2 + y*s, 2 + (x+1)*s - 2, 2 + (y+1)*s - 2],
                            fill=(*color, 220))
+    if alert:
+        # Gold notification dot — top right corner
+        draw.ellipse([44, 0, 63, 19], fill=(255, 208, 106, 255))
+        draw.ellipse([47, 3, 60, 16], fill=(255, 160, 30, 255))
     return img
 
 # ═══════════════════════════════════════════════════════════
@@ -222,6 +326,8 @@ class ComputeWorker(threading.Thread):
         self.jobs_done = 0
         self.compute_hours = 0.0
         self.discoveries = 0
+        self._seen_alert = ''
+        self._seen_update = ''
 
     def emit(self, event, data=None):
         self.msg_queue.put((event, data or {}))
@@ -242,6 +348,19 @@ class ComputeWorker(threading.Thread):
     def paused(self):
         return not self._pause.is_set()
 
+    def _thermal_wait(self):
+        """Pause if CPU temperature exceeds safe threshold."""
+        temp = get_cpu_temp()
+        if temp is None or temp < THERMAL_PAUSE:
+            return
+        self.emit('status', {'text': f'Cooling down ({temp:.0f}°C)...', 'state': 'paused'})
+        while not self._stop.is_set():
+            self._stop.wait(10)
+            temp = get_cpu_temp()
+            if temp is None or temp < THERMAL_RESUME:
+                self.emit('status', {'text': f'Cooled to {temp:.0f}°C — resuming', 'state': 'computing'})
+                return
+
     def run(self):
         self.emit('status', {'text': 'Worker started', 'state': 'computing'})
         backoff = 2
@@ -261,6 +380,9 @@ class ComputeWorker(threading.Thread):
             self._pause.wait()
             if self._stop.is_set():
                 break
+
+            # Thermal protection — wait if CPU is too hot
+            self._thermal_wait()
 
             try:
                 self.emit('status', {'text': 'Fetching job...', 'state': 'computing'})
@@ -321,6 +443,23 @@ class ComputeWorker(threading.Thread):
                     "found_constants": hits, "compute_seconds": duration,
                 }, self.api_key)
 
+                # Check for updates + server alerts after each job
+                try:
+                    vc, vdata = api_get(self.server, "/version")
+                    if vc == 200:
+                        # Alert first (non-blocking), then update prompt (blocking dialog)
+                        # Only emit once per unique message/version
+                        alert = vdata.get('alert', '')
+                        if alert and alert != self._seen_alert:
+                            self._seen_alert = alert
+                            self.emit('server_alert', {'message': alert})
+                        sv = vdata.get('exe_version', '')
+                        if sv and sv != VERSION and sv != self._seen_update:
+                            self._seen_update = sv
+                            self.emit('update_available', {'version': sv})
+                except Exception:
+                    pass
+
             except requests.ConnectionError:
                 self.emit('error', {'text': 'Cannot reach server'})
                 self._stop.wait(backoff)
@@ -340,6 +479,8 @@ class ComputeWorker(threading.Thread):
         vertices, edges, b_ids = base_op.build_graph(k, G1, G2, S, N)
         if self._stop.is_set(): return np.array([])
 
+        self._thermal_wait()
+
         self.emit('stage', {'num': 2, 'name': 'Add Glue', 'detail': f'\u03bb={lam:.6f}'})
         upd, psi_by = base_op.add_glue_edges(vertices, b_ids, lam, w_glue, G1, G2)
         if self._stop.is_set(): return np.array([])
@@ -349,11 +490,15 @@ class ComputeWorker(threading.Thread):
         edges_merged = base_op.merge_edges(edges, upd)
         if self._stop.is_set(): return np.array([])
 
+        self._thermal_wait()
+
         self.emit('stage', {'num': 4, 'name': 'Build Laplacian',
                             'detail': f'{len(vertices):,} vertices'})
         L, _ = base_op.build_magnetic_laplacian(vertices, edges_merged,
                                                  s=(0, 0), psi_by_id=psi_by)
         if self._stop.is_set(): return np.array([])
+
+        self._thermal_wait()
 
         self.emit('stage', {'num': 5, 'name': 'Solve Spectrum', 'detail': 'eigsh M=40'})
         if HAS_GPU:
@@ -391,7 +536,7 @@ def setup_theme(root):
     style.configure('Gold.TLabel', foreground=C['gold'])
     style.configure('Green.TLabel', foreground=C['green'])
     style.configure('Red.TLabel', foreground=C['red'])
-    style.configure('Title.TLabel', foreground=C['cyan'], font=('Consolas', 14, 'bold'))
+    style.configure('Title.TLabel', foreground=C['cyan'], font=(MONO, 14, 'bold'))
     style.configure('TButton', background=C['btn'], foreground=C['text'],
                     borderwidth=1, padding=[10, 4])
     style.map('TButton', background=[('active', C['btn_active']),
@@ -549,11 +694,11 @@ class ComputeTab(ttk.Frame):
         card_inner.pack(fill='x', padx=12, pady=10)
 
         self.status_label = ttk.Label(card_inner, text="Idle", style='Cyan.TLabel',
-                                      font=('Consolas', 12, 'bold'))
+                                      font=(MONO, 12, 'bold'))
         self.status_label.pack(anchor='w')
 
         self.job_label = ttk.Label(card_inner, text="", style='Card.TLabel',
-                                   font=('Consolas', 10))
+                                   font=(MONO, 10))
         self.job_label.pack(anchor='w', pady=(4, 8))
 
         # Stage indicators
@@ -564,7 +709,7 @@ class ComputeTab(ttk.Frame):
                        'Build Laplacian', 'Solve Spectrum']
         for name in stage_names:
             lbl = ttk.Label(self.stage_frame, text=f"  \u25cb  {name}",
-                            style='Card.TLabel', font=('Consolas', 10),
+                            style='Card.TLabel', font=(MONO, 10),
                             foreground=C['dim'])
             lbl.pack(anchor='w', pady=1)
             self.stage_labels.append(lbl)
@@ -573,15 +718,15 @@ class ComputeTab(ttk.Frame):
         stats_row = ttk.Frame(self)
         stats_row.pack(fill='x', padx=12, pady=6)
         self.stats_label = ttk.Label(stats_row, text="Session: 0 jobs, 0.00h compute",
-                                     style='Dim.TLabel', font=('Consolas', 9))
+                                     style='Dim.TLabel', font=(MONO, 9))
         self.stats_label.pack(anchor='w')
 
         # Log
         ttk.Label(self, text="Log", style='Dim.TLabel',
-                  font=('Consolas', 9)).pack(anchor='w', padx=14, pady=(8, 2))
+                  font=(MONO, 9)).pack(anchor='w', padx=14, pady=(8, 2))
         self.log = tk.Text(self, height=10, bg=C['surface'], fg=C['text'],
                            insertbackground=C['text'], selectbackground=C['btn'],
-                           font=('Consolas', 9), borderwidth=1, relief='flat',
+                           font=(MONO, 9), borderwidth=1, relief='flat',
                            state='disabled', wrap='word')
         self.log.pack(fill='both', expand=True, padx=12, pady=(0, 12))
         self.log.tag_config('time', foreground=C['dim'])
@@ -659,12 +804,12 @@ class DashboardTab(ttk.Frame):
         self.progress.pack(fill='x')
 
         self.pct_label = ttk.Label(self, text="0.00%", style='Cyan.TLabel',
-                                   font=('Consolas', 11))
+                                   font=(MONO, 11))
         self.pct_label.pack(anchor='w', padx=14)
 
         # Stats row
         self.stats_label = ttk.Label(self, text="Workers: --  |  Jobs/hr: --  |  Discoveries: --",
-                                     style='Dim.TLabel', font=('Consolas', 9))
+                                     style='Dim.TLabel', font=(MONO, 9))
         self.stats_label.pack(anchor='w', padx=14, pady=(4, 12))
 
         # Dashboard button
@@ -673,7 +818,7 @@ class DashboardTab(ttk.Frame):
         ttk.Button(btn_frame, text="Open Full Dashboard", style='Green.TButton',
                    command=self._open_dashboard).pack(side='left')
         ttk.Label(btn_frame, text="  wathome.akataleptos.com — live data, always current",
-                  style='Dim.TLabel', font=('Consolas', 9)).pack(side='left')
+                  style='Dim.TLabel', font=(MONO, 9)).pack(side='left')
 
         # Two-column: leaderboard + discoveries
         cols = ttk.Frame(self)
@@ -685,7 +830,7 @@ class DashboardTab(ttk.Frame):
         left = ttk.Frame(cols)
         left.grid(row=0, column=0, sticky='nsew', padx=(0, 6))
         ttk.Label(left, text="Leaderboard", style='Dim.TLabel',
-                  font=('Consolas', 9)).pack(anchor='w', pady=(0, 4))
+                  font=(MONO, 9)).pack(anchor='w', pady=(0, 4))
         self.leader_tree = ttk.Treeview(left, columns=('rank', 'name', 'jobs'),
                                          show='headings', height=8)
         self.leader_tree.heading('rank', text='#')
@@ -700,9 +845,9 @@ class DashboardTab(ttk.Frame):
         right = ttk.Frame(cols)
         right.grid(row=0, column=1, sticky='nsew', padx=(6, 0))
         ttk.Label(right, text="Recent Discoveries", style='Gold.TLabel',
-                  font=('Consolas', 9)).pack(anchor='w', pady=(0, 4))
+                  font=(MONO, 9)).pack(anchor='w', pady=(0, 4))
         self.disc_text = tk.Text(right, height=8, bg=C['surface'], fg=C['gold'],
-                                  font=('Consolas', 9), borderwidth=0, state='disabled',
+                                  font=(MONO, 9), borderwidth=0, state='disabled',
                                   wrap='word')
         self.disc_text.pack(fill='both', expand=True)
 
@@ -757,15 +902,15 @@ class ChatTab(ttk.Frame):
         header.pack(fill='x', padx=14, pady=(12, 6))
         ttk.Label(header, text="HIVE CHAT", style='Title.TLabel').pack(side='left')
         self.online_label = ttk.Label(header, text="", style='Dim.TLabel',
-                                      font=('Consolas', 9))
+                                      font=(MONO, 9))
         self.online_label.pack(side='right')
 
         # Messages
         self.chat_text = tk.Text(self, bg=C['surface'], fg=C['text'],
-                                  font=('Consolas', 10), borderwidth=0,
+                                  font=(MONO, 10), borderwidth=0,
                                   state='disabled', wrap='word', spacing3=3)
         self.chat_text.pack(fill='both', expand=True, padx=14, pady=(0, 6))
-        self.chat_text.tag_config('user', foreground=C['cyan'], font=('Consolas', 10, 'bold'))
+        self.chat_text.tag_config('user', foreground=C['cyan'], font=(MONO, 10, 'bold'))
         self.chat_text.tag_config('time', foreground=C['dim'])
         self.chat_text.tag_config('msg', foreground=C['text'])
         self.chat_text.tag_config('system', foreground=C['violet'])
@@ -773,7 +918,7 @@ class ChatTab(ttk.Frame):
         # Input
         input_row = ttk.Frame(self)
         input_row.pack(fill='x', padx=14, pady=(0, 12))
-        self.msg_entry = ttk.Entry(input_row, font=('Consolas', 10))
+        self.msg_entry = ttk.Entry(input_row, font=(MONO, 10))
         self.msg_entry.pack(side='left', fill='x', expand=True, padx=(0, 6))
         self.msg_entry.bind('<Return>', lambda e: self._send())
         ttk.Button(input_row, text="Send", command=self._send).pack(side='right')
@@ -889,6 +1034,10 @@ class SettingsTab(ttk.Frame):
         ttk.Checkbutton(self, text="Start computing automatically on launch",
                         variable=self.autostart_var).pack(anchor='w', padx=14, pady=4)
 
+        self.boot_var = tk.BooleanVar(value=self.app.config.get('start_on_boot', False))
+        ttk.Checkbutton(self, text="Start W@Home when computer starts",
+                        variable=self.boot_var).pack(anchor='w', padx=14, pady=4)
+
         # Buttons
         btn_row = ttk.Frame(self)
         btn_row.pack(fill='x', padx=14, pady=(20, 6))
@@ -901,10 +1050,36 @@ class SettingsTab(ttk.Frame):
         self.save_status = ttk.Label(self, text="", style='Dim.TLabel')
         self.save_status.pack(anchor='w', padx=14, pady=4)
 
-        # Version
-        ttk.Label(self, text=f"W@Home v{VERSION} — akataleptos.com",
-                  style='Dim.TLabel', font=('Consolas', 9)).pack(
-                      anchor='w', padx=14, pady=(20, 8))
+        # ── About ──
+        sep = ttk.Separator(self, orient='horizontal')
+        sep.pack(fill='x', padx=14, pady=(16, 0))
+
+        about = ttk.Frame(self)
+        about.pack(fill='x', padx=14, pady=(10, 8))
+
+        ttk.Label(about, text=f"W@Home Hive  v{VERSION}",
+                  style='Card.TLabel', font=(MONO, 11)).pack(anchor='w')
+        ttk.Label(about, text="Distributed Menger spectral search",
+                  style='Dim.TLabel', font=(MONO, 9)).pack(anchor='w', pady=(2, 6))
+
+        info_lines = [
+            ("Publisher", "Akataleptos"),
+            ("Contact", "obi@akataleptos.com"),
+            ("Website", "https://wathome.akataleptos.com"),
+        ]
+        for label, value in info_lines:
+            row = ttk.Frame(about)
+            row.pack(fill='x', pady=1)
+            ttk.Label(row, text=f"{label}:", style='Dim.TLabel',
+                      font=(MONO, 9), width=10).pack(side='left')
+            if value.startswith('http'):
+                link = ttk.Label(row, text=value, font=(MONO, 9),
+                                 foreground=C['cyan'], cursor='hand2')
+                link.pack(side='left')
+                link.bind('<Button-1>', lambda e, u=value: webbrowser.open(u))
+            else:
+                ttk.Label(row, text=value, style='Card.TLabel',
+                          font=(MONO, 9)).pack(side='left')
 
     def _save(self):
         cfg = self.app.config
@@ -912,31 +1087,138 @@ class SettingsTab(ttk.Frame):
         cfg['server'] = self.server_var.get().strip().rstrip('/')
         cfg['minimize_to_tray'] = self.tray_var.get()
         cfg['auto_compute'] = self.autostart_var.get()
+        cfg['start_on_boot'] = self.boot_var.get()
         save_config(cfg)
         self.app.server = cfg.get('server', DEFAULT_SERVER)
+        _set_boot_autostart(self.boot_var.get())
         self.save_status.config(text="Saved", style='Green.TLabel')
         self.app.root.after(2000, lambda: self.save_status.config(text=""))
 
-    def _check_update(self):
-        self.save_status.config(text="Checking...", style='Dim.TLabel')
-        self.update()
+    def _check_update(self, silent=False):
+        """Check for updates and server alerts."""
+        if not silent:
+            self.save_status.config(text="Checking...", style='Dim.TLabel')
+            self.update()
         try:
             code, data = api_get(self.app.server, "/version")
             if code == 200:
-                server_hash = data.get('client_version', '')
-                try:
-                    with open(os.path.abspath(__file__), 'rb') as f:
-                        local_hash = hashlib.sha256(f.read()).hexdigest()[:16]
-                except Exception:
-                    local_hash = 'unknown'
-                if server_hash and server_hash != local_hash and server_hash != 'unknown':
-                    self.save_status.config(text="Update available!", style='Gold.TLabel')
+                # Server alert — show before update dialog
+                alert = data.get('alert', '')
+                if alert:
+                    self.app.compute_tab.log_msg(f"[SERVER] {alert}", 'gold')
+                    self.app._set_alert(alert)
+
+                server_ver = data.get('exe_version', '')
+                if server_ver and server_ver != VERSION:
+                    self.save_status.config(
+                        text=f"Update available: v{server_ver}", style='Gold.TLabel')
+                    if messagebox.askyesno("Update Available",
+                            f"W@Home v{server_ver} is available (you have v{VERSION}).\n\n"
+                            f"Download and install?"):
+                        self._download_update()
                 else:
-                    self.save_status.config(text="Up to date", style='Green.TLabel')
+                    if not silent:
+                        self.save_status.config(text="Up to date", style='Green.TLabel')
             else:
-                self.save_status.config(text="Could not check", style='Red.TLabel')
+                if not silent:
+                    self.save_status.config(text="Could not check", style='Red.TLabel')
         except Exception:
-            self.save_status.config(text="Server unreachable", style='Red.TLabel')
+            if not silent:
+                self.save_status.config(text="Server unreachable", style='Red.TLabel')
+
+    def _download_update(self):
+        """Download update — platform-aware."""
+        self.save_status.config(text="Downloading...", style='Dim.TLabel')
+        self.update()
+
+        if getattr(sys, 'frozen', False):
+            # Windows frozen exe — download installer
+            self._download_windows_update()
+        else:
+            # Linux/macOS — update .py files in place
+            self._download_py_update()
+
+    def _download_windows_update(self):
+        """Download WHome-Setup.exe and launch it."""
+        def _dl():
+            try:
+                url = f"{self.app.server}/WHome-Setup.exe"
+                r = requests.get(url, stream=True, timeout=120)
+                if r.status_code != 200:
+                    self.app.root.after(0, lambda: self.save_status.config(
+                        text="Download failed", style='Red.TLabel'))
+                    return
+
+                dl_dir = os.path.join(os.environ.get('TEMP', APP_DIR), 'WHome-Update')
+                os.makedirs(dl_dir, exist_ok=True)
+                dl_path = os.path.join(dl_dir, 'WHome-Setup.exe')
+
+                total = int(r.headers.get('content-length', 0))
+                downloaded = 0
+                with open(dl_path, 'wb') as f:
+                    for chunk in r.iter_content(chunk_size=256 * 1024):
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if total > 0:
+                            pct = downloaded * 100 // total
+                            self.app.root.after(0, lambda p=pct: self.save_status.config(
+                                text=f"Downloading... {p}%", style='Dim.TLabel'))
+
+                self.app.root.after(0, lambda: self._launch_installer(dl_path))
+            except Exception as e:
+                self.app.root.after(0, lambda: self.save_status.config(
+                    text=f"Download error: {e}", style='Red.TLabel'))
+
+        threading.Thread(target=_dl, daemon=True).start()
+
+    def _download_py_update(self):
+        """Download updated .py files and restart (Linux/macOS)."""
+        update_files = ['whome_gui.py', 'screensaver.py', 'w_operator.py', 'w_cuda.py', 'client.py']
+
+        def _dl():
+            try:
+                updated = 0
+                for fname in update_files:
+                    url = f"{self.app.server}/static/{fname}"
+                    r = requests.get(url, timeout=30)
+                    if r.status_code == 200:
+                        dest = os.path.join(APP_DIR, fname)
+                        with open(dest, 'w') as f:
+                            f.write(r.text)
+                        updated += 1
+                        self.app.root.after(0, lambda n=fname: self.save_status.config(
+                            text=f"Updated {n}...", style='Dim.TLabel'))
+
+                if updated > 0:
+                    self.app.root.after(0, lambda: self._restart_app(updated))
+                else:
+                    self.app.root.after(0, lambda: self.save_status.config(
+                        text="No files updated", style='Red.TLabel'))
+            except Exception as e:
+                self.app.root.after(0, lambda: self.save_status.config(
+                    text=f"Update error: {e}", style='Red.TLabel'))
+
+        threading.Thread(target=_dl, daemon=True).start()
+
+    def _restart_app(self, count):
+        """Restart the app after updating files."""
+        self.save_status.config(
+            text=f"Updated {count} files — restarting...", style='Green.TLabel')
+        self.update()
+        import subprocess
+        # Re-launch with same Python and same args
+        subprocess.Popen([sys.executable, os.path.abspath(__file__)] + sys.argv[1:])
+        self.app.root.after(1000, self.app.root.destroy)
+
+    def _launch_installer(self, path):
+        """Launch the downloaded Windows installer and exit."""
+        self.save_status.config(text="Launching installer...", style='Green.TLabel')
+        try:
+            import subprocess
+            subprocess.Popen([path], shell=True)
+            self.app.root.after(1000, self.app.root.destroy)
+        except Exception as e:
+            self.save_status.config(text=f"Launch failed: {e}", style='Red.TLabel')
 
 # ═══════════════════════════════════════════════════════════
 # Main Application
@@ -944,7 +1226,7 @@ class SettingsTab(ttk.Frame):
 
 class WHomeApp:
     def __init__(self):
-        self.root = tk.Tk()
+        self.root = tk.Tk(className='whome')
         self.root.title("W@Home Hive")
         self.root.geometry("820x620")
         self.root.minsize(640, 480)
@@ -959,10 +1241,19 @@ class WHomeApp:
         self.worker = None
         self.msg_queue = queue.Queue()
         self.tray = None
+        self._pending_alert = None  # unread server alert message
+        self._tray_state = 'idle'   # current tray icon state for redraw
+        self._compute_start_time = None  # tracks when current job started
+        self._session_jobs = 0
+        self._session_hours = 0.0
+        self._session_disc = 0
         self._scr_state = {
             'job_id': None, 'lambda_val': None, 'stage': '',
             'stage_num': 0, 'jobs_done': 0, 'active': False,
         }
+
+        # Copy config to shared location so screensaver can find it
+        self._copy_config_to_shared()
 
         # First-run setup if needed
         if not self.api_key:
@@ -973,13 +1264,62 @@ class WHomeApp:
             self.config = load_config()
             self.api_key = result['api_key']
             self.server = result['server']
+            self._copy_config_to_shared()
 
-        # Window icon (set title bar text icon as fallback)
+        # Window icon — Menger pattern for title bar + taskbar
         try:
-            icon_path = os.path.join(APP_DIR, 'icon-192.png')
-            if os.path.exists(icon_path):
-                icon = tk.PhotoImage(file=icon_path)
-                self.root.iconphoto(True, icon)
+            if sys.platform == 'win32':
+                # On Windows, use the exe's own embedded icon if running as frozen exe
+                # Otherwise generate a temp .ico
+                ico_path = None
+                if getattr(sys, 'frozen', False):
+                    ico_path = sys.executable
+                if not ico_path or not os.path.exists(ico_path):
+                    from PIL import Image, ImageDraw
+                    import tempfile
+                    def _mk(sz):
+                        img = Image.new('RGBA', (sz, sz), (13, 13, 26, 255))
+                        d = ImageDraw.Draw(img)
+                        c = (96, 232, 255, 220)
+                        s = sz // 3
+                        for x in range(3):
+                            for y in range(3):
+                                if x == 1 and y == 1: continue
+                                s2 = s // 3
+                                if s2 >= 2:
+                                    for x2 in range(3):
+                                        for y2 in range(3):
+                                            if x2 == 1 and y2 == 1: continue
+                                            d.rectangle([x*s+x2*s2, y*s+y2*s2, x*s+(x2+1)*s2-1, y*s+(y2+1)*s2-1], fill=c)
+                                else:
+                                    d.rectangle([x*s, y*s, (x+1)*s-1, (y+1)*s-1], fill=c)
+                        return img
+                    icons = [_mk(sz) for sz in [16, 32, 48, 64, 128, 256]]
+                    ico_path = os.path.join(tempfile.gettempdir(), 'whome_icon.ico')
+                    icons[0].save(ico_path, format='ICO', append_images=icons[1:],
+                                  sizes=[(sz, sz) for sz in [16, 32, 48, 64, 128, 256]])
+                self.root.iconbitmap(default=ico_path)
+            else:
+                from PIL import Image, ImageTk, ImageDraw
+                def _mk(sz):
+                    img = Image.new('RGBA', (sz, sz), (13, 13, 26, 255))
+                    d = ImageDraw.Draw(img)
+                    c = (96, 232, 255, 220)
+                    s = sz // 3
+                    for x in range(3):
+                        for y in range(3):
+                            if x == 1 and y == 1: continue
+                            s2 = s // 3
+                            if s2 >= 2:
+                                for x2 in range(3):
+                                    for y2 in range(3):
+                                        if x2 == 1 and y2 == 1: continue
+                                        d.rectangle([x*s+x2*s2, y*s+y2*s2, x*s+(x2+1)*s2-1, y*s+(y2+1)*s2-1], fill=c)
+                            else:
+                                d.rectangle([x*s, y*s, (x+1)*s-1, (y+1)*s-1], fill=c)
+                    return img
+                self._icon_photos = [ImageTk.PhotoImage(_mk(sz)) for sz in [16, 32, 48, 64]]
+                self.root.iconphoto(True, *self._icon_photos)
         except Exception:
             pass
 
@@ -995,6 +1335,9 @@ class WHomeApp:
         # Auto-start if configured
         if self.config.get('auto_compute', False):
             self.root.after(500, self.start_compute)
+
+        # Auto-check for updates (silent — only prompts if update found)
+        self.root.after(3000, lambda: self.settings_tab._check_update(silent=True))
 
     def _run_setup(self):
         """First-run setup — build registration form directly in root window."""
@@ -1084,11 +1427,11 @@ class WHomeApp:
         self.statusbar = ttk.Frame(self.root, style='Card.TFrame')
         self.statusbar.pack(side='bottom', fill='x')
         self.status_text = ttk.Label(self.statusbar, text="\u25cf  Connected",
-                                     style='Card.TLabel', font=('Consolas', 9),
+                                     style='Card.TLabel', font=(MONO, 9),
                                      foreground=C['green'])
         self.status_text.pack(side='left', padx=12, pady=6)
         self.session_text = ttk.Label(self.statusbar, text="",
-                                      style='Card.TLabel', font=('Consolas', 9),
+                                      style='Card.TLabel', font=(MONO, 9),
                                       foreground=C['dim'])
         self.session_text.pack(side='right', padx=12, pady=6)
 
@@ -1112,6 +1455,15 @@ class WHomeApp:
             return
         icon = create_tray_icon('idle')
         menu = pystray.Menu(
+            pystray.MenuItem(
+                lambda item: f'Alert: {self._pending_alert[:40]}...'
+                             if self._pending_alert and len(self._pending_alert) > 40
+                             else f'Alert: {self._pending_alert}'
+                             if self._pending_alert else 'No alerts',
+                self._tray_read_alert,
+                visible=lambda item: self._pending_alert is not None,
+            ),
+            pystray.Menu.SEPARATOR,
             pystray.MenuItem('Show', self._tray_show, default=True),
             pystray.MenuItem('Pause / Resume', self.toggle_pause),
             pystray.Menu.SEPARATOR,
@@ -1124,11 +1476,31 @@ class WHomeApp:
         threading.Thread(target=self.tray.run, daemon=True).start()
 
     def _update_tray_icon(self, state):
+        self._tray_state = state
         if self.tray and HAS_TRAY:
             try:
-                self.tray.icon = create_tray_icon(state)
+                self.tray.icon = create_tray_icon(state, alert=self._pending_alert is not None)
             except Exception:
                 pass
+
+    def _set_alert(self, message):
+        """Set a pending alert — shows dot on tray icon and menu item."""
+        self._pending_alert = message
+        self._update_tray_icon(self._tray_state)
+        # Also fire a system notification
+        if self.tray:
+            try:
+                self.tray.notify(message, "W@Home Alert")
+            except Exception:
+                pass
+
+    def _tray_read_alert(self, icon=None, item=None):
+        """User clicked the alert — show it and clear the indicator."""
+        msg = self._pending_alert
+        self._pending_alert = None
+        self._update_tray_icon(self._tray_state)
+        if msg:
+            self.root.after(0, lambda: messagebox.showinfo("W@Home Alert", msg))
 
     def _tray_show(self, icon=None, item=None):
         self.root.after(0, self._show_window)
@@ -1194,14 +1566,23 @@ class WHomeApp:
             self._update_tray_icon('paused')
 
     def launch_screensaver(self, icon=None, item=None):
-        script = os.path.join(APP_DIR, 'screensaver.py')
-        if os.path.exists(script):
+        if getattr(sys, 'frozen', False):
+            # Bundled: launch ourselves with --screensaver flag
             try:
-                subprocess.Popen([sys.executable, script,
-                                  '--server', self.server])
+                subprocess.Popen([sys.executable, '--screensaver'])
             except Exception as e:
                 self.root.after(0, lambda: messagebox.showerror(
                     "Error", f"Failed to launch screensaver:\n{e}"))
+        else:
+            # Running from source: use python + screensaver.py
+            script = os.path.join(APP_DIR, 'screensaver.py')
+            if os.path.exists(script):
+                try:
+                    subprocess.Popen([sys.executable, script,
+                                      '--server', self.server])
+                except Exception as e:
+                    self.root.after(0, lambda: messagebox.showerror(
+                        "Error", f"Failed to launch screensaver:\n{e}"))
 
     # ── Queue polling ──
 
@@ -1212,19 +1593,47 @@ class WHomeApp:
                 self._handle_event(event, data)
         except queue.Empty:
             pass
+        # Live session stats — show running total including current job time
+        if self._compute_start_time is not None:
+            elapsed = (time.time() - self._compute_start_time) / 3600
+            total_h = self._session_hours + elapsed
+            jobs_txt = f"{self._session_jobs}" if self._session_jobs else "0"
+            self.compute_tab.stats_label.config(
+                text=f"Session: {jobs_txt} jobs, {total_h:.2f}h compute"
+                     f" (job running {time.time() - self._compute_start_time:.0f}s)")
+            self.session_text.config(
+                text=f"{jobs_txt} jobs | {total_h:.2f}h | computing...")
         self.root.after(100, self._poll_queue)
+
+    def _shared_dir(self):
+        if sys.platform == 'win32':
+            return os.path.join(os.environ.get('LOCALAPPDATA', APP_DIR), 'WHome')
+        return os.path.join(os.path.expanduser('~'), '.whome')
 
     def _write_scr_status(self):
         """Write compute state to shared location for screensaver to read."""
         try:
-            if sys.platform == 'win32':
-                shared = os.path.join(os.environ.get('LOCALAPPDATA', APP_DIR), 'WHome')
-            else:
-                shared = os.path.join(os.path.expanduser('~'), '.whome')
+            shared = self._shared_dir()
             os.makedirs(shared, exist_ok=True)
             status_path = os.path.join(shared, 'compute_status.json')
+            state = dict(self._scr_state)
+            state['pid'] = os.getpid()
+            state['source'] = 'gui'
             with open(status_path, 'w') as f:
-                json.dump(self._scr_state, f)
+                json.dump(state, f)
+        except Exception:
+            pass
+
+    def _copy_config_to_shared(self):
+        """Copy worker config to shared location so screensaver can find it."""
+        try:
+            shared = self._shared_dir()
+            os.makedirs(shared, exist_ok=True)
+            src = CONFIG_PATH
+            dst = os.path.join(shared, 'worker_config.json')
+            if os.path.exists(src):
+                import shutil
+                shutil.copy2(src, dst)
         except Exception:
             pass
 
@@ -1239,12 +1648,15 @@ class WHomeApp:
                 foreground=C['green'] if state == 'computing' else
                            C['gold'] if state == 'paused' else C['dim'])
             self._scr_state['active'] = (state == 'computing')
+            if state != 'computing':
+                self._compute_start_time = None  # not actively computing
             if state == 'idle' and self.worker and not self.worker.is_alive():
                 tab.set_computing(False)
                 tab.reset_stages()
                 self._scr_state['active'] = False
         elif event == 'job_start':
             self._update_tray_icon('computing')
+            self._compute_start_time = time.time()
             tab.set_job(data['job_id'], data['lambda'], data['params'])
             tab.reset_stages()
             tab.log_msg(f"Job #{data['job_id']} started \u2014 \u03bb={data['lambda']:.6f}")
@@ -1264,6 +1676,7 @@ class WHomeApp:
                 'stage': data['name'], 'stage_num': data['num'],
             })
         elif event == 'job_done':
+            self._compute_start_time = None  # job finished, stop live timer
             tab.set_status("Job complete")
             n = data.get('n_eigs', 0)
             dur = data.get('duration', 0)
@@ -1272,15 +1685,31 @@ class WHomeApp:
                     tab.log_msg(f"  \u2605 RESONANCE: {h}", 'gold')
             else:
                 tab.log_msg(f"  Complete \u2014 {n} eigenvalues in {dur:.1f}s", 'green')
-            tab.update_stats(data.get('session_jobs', 0),
-                             data.get('session_hours', 0),
-                             data.get('session_disc', 0))
+            self._session_jobs = data.get('session_jobs', 0)
+            self._session_hours = data.get('session_hours', 0)
+            self._session_disc = data.get('session_disc', 0)
+            tab.update_stats(self._session_jobs, self._session_hours, self._session_disc)
             self.session_text.config(
-                text=f"{data.get('session_jobs',0)} jobs | "
-                     f"{data.get('session_hours',0):.2f}h")
-            self._scr_state['jobs_done'] = data.get('session_jobs', 0)
+                text=f"{self._session_jobs} jobs | {self._session_hours:.2f}h")
+            self._scr_state['jobs_done'] = self._session_jobs
             self._scr_state['stage'] = 'Complete'
             self._scr_state['stage_num'] = 6
+        elif event == 'update_available':
+            ver = data.get('version', '?')
+            tab.log_msg(f"Update available: v{ver}", 'gold')
+            self.settings_tab.save_status.config(
+                text=f"Update available: v{ver}", style='Gold.TLabel')
+            if self.tray:
+                try:
+                    self.tray.notify(f"W@Home v{ver} available",
+                                     "Click Check for Update in Settings")
+                except Exception:
+                    pass
+        elif event == 'server_alert':
+            msg = data.get('message', '')
+            if msg:
+                tab.log_msg(f"[SERVER] {msg}", 'gold')
+                self._set_alert(msg)
         elif event == 'error':
             tab.log_msg(data.get('text', 'Unknown error'), 'error')
             self._update_tray_icon('error')
@@ -1370,10 +1799,50 @@ def main():
     app = WHomeApp()
     app.run()
 
+def _is_screensaver_mode():
+    """Check if launched as Windows screensaver (.scr with /s, /c, /p flags)."""
+    args = [a.lower().lstrip('/').lstrip('-') for a in sys.argv[1:]]
+    if 'p' in args:
+        sys.exit(0)  # Preview mode — skip
+    if 'c' in args:
+        # Config dialog
+        try:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(
+                0, "W@Home Screensaver\n\nConfigure via the W@Home Hive app.",
+                "W@Home Settings", 0x40)
+        except Exception:
+            pass
+        sys.exit(0)
+    if 's' in args or '--screensaver' in sys.argv[1:]:
+        return True
+    # Also detect if invoked as .scr without flags (double-click on .scr = /s)
+    if getattr(sys, 'frozen', False) and sys.executable.lower().endswith('.scr'):
+        return True
+    return False
+
+
 if __name__ == '__main__':
-    try:
-        main()
-    except Exception as e:
-        messagebox.showerror("W@Home Error", str(e))
-        if getattr(sys, 'frozen', False):
-            input("Press Enter to exit...")
+    if _is_screensaver_mode():
+        # Launch screensaver
+        try:
+            scr_dir = os.path.dirname(os.path.abspath(__file__))
+            if getattr(sys, 'frozen', False):
+                scr_dir = getattr(sys, '_MEIPASS', scr_dir)
+            sys.path.insert(0, scr_dir)
+            from screensaver import run_screensaver
+            run_screensaver(fullscreen=True)
+        except Exception as e:
+            try:
+                import ctypes
+                ctypes.windll.user32.MessageBoxW(
+                    0, f"Screensaver error:\n{e}", "W@Home", 0x10)
+            except Exception:
+                print(f"Screensaver error: {e}")
+    else:
+        try:
+            main()
+        except Exception as e:
+            messagebox.showerror("W@Home Error", str(e))
+            if getattr(sys, 'frozen', False):
+                input("Press Enter to exit...")

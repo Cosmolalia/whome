@@ -6,7 +6,7 @@ Usage:
     python build_windows.py --inno   # Build exe + installer (requires Inno Setup)
 
 Prerequisites:
-    pip install pyinstaller pystray Pillow requests numpy scipy
+    pip install pyinstaller pystray Pillow requests numpy scipy pygame moderngl pyrr
     Optional: pip install cupy-cuda12x  (GPU support)
     Optional: Install Inno Setup 6 (for --inno flag)
 """
@@ -49,7 +49,7 @@ def create_icon():
 
 
 def build_exe():
-    """Build standalone .exe with PyInstaller."""
+    """Build standalone .exe with PyInstaller — includes screensaver."""
     print("\n  Building W@Home executable...\n")
 
     ico = create_icon()
@@ -71,13 +71,26 @@ def build_exe():
     if ico:
         cmd.extend(['--icon', ico])
 
-    # Hidden imports for optional dependencies
+    # Hidden imports — includes screensaver deps
     cmd.extend([
         '--hidden-import=pystray',
         '--hidden-import=PIL',
         '--hidden-import=PIL.Image',
         '--hidden-import=PIL.ImageDraw',
+        '--hidden-import=pygame',
+        '--hidden-import=moderngl',
+        '--hidden-import=pyrr',
+        '--hidden-import=pyrr.Matrix44',
+        '--hidden-import=pyrr.Vector3',
     ])
+
+    # Exclude heavy packages that get pulled in from global env
+    for mod in ['torch', 'torchvision', 'tensorflow', 'qiskit',
+                'Panda3D', 'panda3d', 'ursina', 'sympy',
+                'symengine', 'matplotlib', 'flask', 'jinja2',
+                'pywebview', 'beautifulsoup4', 'bs4', 'cryptography',
+                'GitPython', 'git', 'rustworkx']:
+        cmd.extend(['--exclude-module', mod])
 
     cmd.append('whome_gui.py')
 
@@ -95,6 +108,11 @@ def build_exe():
     else:
         print("\n  [!!] Expected output not found")
         sys.exit(1)
+
+    # Copy exe as .scr (Windows screensavers are just renamed exes)
+    scr_path = os.path.join(DIST_DIR, 'WHome.scr')
+    shutil.copy2(exe_path, scr_path)
+    print(f"  [OK] Copied: {scr_path}")
 
     # Copy supporting files to dist/ for Inno Setup
     for f in ['w_operator.py', 'w_cuda.py', 'screensaver.py', 'icon-192.png']:
@@ -131,7 +149,7 @@ def build_installer():
     print(f"\n  Building installer with {iscc}...")
     result = subprocess.run([iscc, iss_path], cwd=APP_DIR)
     if result.returncode == 0:
-        print("\n  [OK] Installer built: Output/WHome-Setup.exe")
+        print("\n  [OK] Installer built: dist/WHome-Setup.exe")
     else:
         print("\n  [!!] Inno Setup build failed")
 
@@ -150,6 +168,7 @@ if __name__ == '__main__':
     print()
     print("  Done. To distribute:")
     print(f"    Standalone:  dist/WHome.exe")
+    print(f"    Screensaver: dist/WHome.scr")
     if '--inno' in sys.argv:
-        print(f"    Installer:   Output/WHome-Setup.exe")
+        print(f"    Installer:   dist/WHome-Setup.exe")
     print()

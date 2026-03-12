@@ -88,6 +88,22 @@ def http_post_json(url, json_data=None, headers=None, timeout=30):
         parsed = {"raw": body}
     return code, parsed
 
+def http_get_json(url, timeout=15):
+    """GET and parse JSON response."""
+    if HAS_REQUESTS:
+        resp = requests.get(url, timeout=timeout)
+        return resp.status_code, resp.json()
+    else:
+        req = urllib.request.Request(url, method='GET')
+        try:
+            with urllib.request.urlopen(req, timeout=timeout, context=_ssl_ctx) as resp:
+                body = resp.read().decode('utf-8')
+                return resp.status, json.loads(body)
+        except urllib.error.HTTPError as e:
+            return e.code, {}
+        except Exception:
+            return 0, {}
+
 # ═══════════════════════════════════════════════════════════
 # Pure-Python sparse eigensolver fallback
 # ═══════════════════════════════════════════════════════════
@@ -231,6 +247,7 @@ if not HAS_SCIPY:
 # Constants & config
 # ═══════════════════════════════════════════════════════════
 
+VERSION = "1.0.1"
 DEFAULT_SERVER = "https://wathome.akataleptos.com"
 
 CONSTANTS = {
@@ -701,40 +718,24 @@ class SettingsScreen(Screen):
         row.add_widget(self.notify_hits)
         layout.add_widget(row)
 
-        # --- Email for updates/recovery ---
-        layout.add_widget(Label(
-            text='Email (optional — for updates & account recovery)',
-            font_size=dp(13),
-            color=DIM_COLOR,
-            size_hint_y=None,
-            height=dp(22),
-            halign='left',
-        ))
-        self.email_input = TextInput(
-            hint_text='you@example.com',
-            multiline=False,
-            font_size=dp(14),
-            size_hint_y=None,
-            height=dp(40),
+        # Server alert banner (hidden until alert arrives)
+        self.alert_bar = BoxLayout(
+            size_hint_y=None, height=dp(0), spacing=dp(4),
+            padding=(dp(8), dp(4)),
         )
-        layout.add_widget(self.email_input)
-
-        layout.add_widget(Label(
-            text='Confirm email',
-            font_size=dp(13),
-            color=DIM_COLOR,
-            size_hint_y=None,
-            height=dp(22),
-            halign='left',
-        ))
-        self.email_confirm = TextInput(
-            hint_text='re-enter email to confirm',
-            multiline=False,
-            font_size=dp(14),
-            size_hint_y=None,
-            height=dp(40),
+        self.alert_label = Label(
+            text='', font_size=dp(12), color=GOLD,
+            size_hint_x=0.85, halign='left',
+            text_size=(Window.width - dp(80), None),
         )
-        layout.add_widget(self.email_confirm)
+        self.alert_bar.add_widget(self.alert_label)
+        dismiss_btn = Button(
+            text='X', font_size=dp(12), size_hint_x=0.15,
+            background_color=get_color_from_hex('#664422'),
+        )
+        dismiss_btn.bind(on_press=self.dismiss_alert)
+        self.alert_bar.add_widget(dismiss_btn)
+        layout.add_widget(self.alert_bar)
 
         # Save button
         save_btn = Button(
@@ -790,7 +791,7 @@ class SettingsScreen(Screen):
 
         # Info label (for about/help messages)
         self.info_label = Label(
-            text='W@Home v0.2.1 — Akataleptos Spectral Search',
+            text=f'W@Home v{VERSION} — Akataleptos Spectral Search',
             font_size=dp(11),
             color=DIM_COLOR,
             size_hint_y=None,
@@ -817,23 +818,16 @@ class SettingsScreen(Screen):
         name = cfg.get('name', '?')
         wid = cfg.get('worker_id', '')[:8]
         self.account_label.text = f'Logged in as: {name} ({wid})'
-        self.info_label.text = 'W@Home v0.2.1 \u2014 Akataleptos Spectral Search'
+        self.info_label.text = f'W@Home v{VERSION} \u2014 Akataleptos Spectral Search'
+        # Check for alerts + updates on settings open
+        threading.Thread(target=self._check_server, daemon=True).start()
 
     def save_settings(self, instance):
-        # Validate email match
-        email = self.email_input.text.strip()
-        confirm = self.email_confirm.text.strip()
-        if email and email != confirm:
-            self.info_label.text = 'Emails do not match. Please re-enter.'
-            self.info_label.color = RED
-            return
-
         cfg = load_config()
         cfg['charge_only'] = self.charge_only.active
         cfg['max_jobs'] = int(self.max_jobs.text or 0)
         cfg['cooldown'] = int(self.cooldown.text or 0)
         cfg['notify_hits'] = self.notify_hits.active
-        cfg['email'] = email
         save_config(cfg)
         self.info_label.text = 'Settings saved!'
         self.info_label.color = GREEN
@@ -844,17 +838,57 @@ class SettingsScreen(Screen):
     def show_about(self, instance):
         self.info_label.color = DIM_COLOR
         self.info_label.text = (
-            'W@Home v0.2.1\n'
-            'Distributed eigenvalue computation by Akataleptos.\n'
-            'Your device searches for universal constants\n'
-            'hidden in the Menger sponge spectrum.'
+            f'W@Home Hive v{VERSION}\n'
+            'Distributed Menger spectral search\n\n'
+            'Publisher: Akataleptos\n'
+            'Contact: obi@akataleptos.com\n'
+            'Website: wathome.akataleptos.com'
         )
 
     def show_help(self, instance):
         self.info_label.color = DIM_COLOR
         self.info_label.text = (
-            'Contact: hive@akataleptos.com\n'
+            'Your device searches for universal constants\n'
+            'hidden in the Menger sponge spectrum.\n\n'
+            'Contact: obi@akataleptos.com\n'
             'Website: wathome.akataleptos.com'
+        )
+
+    def _check_server(self):
+        """Check for alerts and updates from server."""
+        try:
+            cfg = load_config()
+            server = cfg.get('server', DEFAULT_SERVER)
+            code, data = http_get_json(f"{server}/version")
+            if code == 200:
+                # Server alert
+                alert = data.get('alert', '')
+                if alert:
+                    Clock.schedule_once(lambda dt: self.show_alert(alert))
+                # Version check
+                sv = data.get('exe_version', '')
+                if sv and sv != VERSION:
+                    Clock.schedule_once(
+                        lambda dt, v=sv: self._show_update(v))
+        except Exception:
+            pass
+
+    def show_alert(self, message):
+        """Show server alert in the alert banner."""
+        self.alert_label.text = message
+        self.alert_bar.height = dp(44)
+
+    def dismiss_alert(self, instance):
+        """Dismiss the alert banner."""
+        self.alert_label.text = ''
+        self.alert_bar.height = dp(0)
+
+    def _show_update(self, version):
+        """Show update available in info label."""
+        self.info_label.color = GOLD
+        self.info_label.text = (
+            f'Update available: v{version}\n'
+            f'You have v{VERSION}. Tap Update to download.'
         )
 
     def open_download(self, instance):
@@ -1283,6 +1317,8 @@ class SpongeView(Widget):
         self.auto_rotate = True
         self._build_sponge()
         self.zoom = 0.32  # default zoom factor
+        self._t = 0.0  # animation time
+        self._last_touch = 0.0  # for auto-resume after idle
         self._anim = Clock.schedule_interval(self._animate, 1.0 / 30)
         self.bind(size=self._redraw, pos=self._redraw)
         # Touch: single drag = rotate, pinch = zoom
@@ -1342,6 +1378,7 @@ class SpongeView(Widget):
             if len(self._touches) == 1:
                 self._touch_prev = touch.pos
                 self.auto_rotate = False
+                self._last_touch = self._t
             elif len(self._touches) == 2:
                 self._pinch_start = self._pinch_dist()
                 self._zoom_start = self.zoom
@@ -1376,12 +1413,17 @@ class SpongeView(Widget):
             touch.ungrab(self)
             self._touches.pop(touch.uid, None)
             self._touch_prev = None
+            self._last_touch = self._t
             return True
         return super().on_touch_up(touch)
 
     def _animate(self, dt):
+        self._t += dt
+        if not self.auto_rotate and (self._t - self._last_touch) > 4.0:
+            self.auto_rotate = True  # resume after 4s idle
         if self.auto_rotate:
             self.rot_y += 0.012
+            self.rot_x = -0.4 + 0.15 * math.sin(self._t * 0.3)  # gentle wobble
         self._redraw()
 
     def _redraw(self, *args):
@@ -1467,28 +1509,46 @@ class SpongeScreen(Screen):
 
         layout = BoxLayout(orientation='vertical')
 
-        # Header with back button (consistent with Settings/Dashboard)
-        header = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(8), padding=(dp(8), 0))
+        # Header with back button + level control
+        header = BoxLayout(size_hint_y=None, height=dp(44), spacing=dp(6), padding=(dp(8), 0))
         back_btn = Button(
             text='< Back',
             font_size=dp(14),
-            size_hint_x=0.3,
+            size_hint_x=0.22,
             background_color=get_color_from_hex('#446688'),
         )
         back_btn.bind(on_press=self._go_back)
         header.add_widget(back_btn)
         header.add_widget(Label(
             text='3D SPONGE',
-            font_size=dp(18),
+            font_size=dp(16),
             bold=True,
             color=ACCENT,
-            size_hint_x=0.4,
+            size_hint_x=0.3,
         ))
+
+        # Level buttons
+        for lvl in (1, 2, 3):
+            btn = Button(
+                text=f'L{lvl}',
+                font_size=dp(13),
+                size_hint_x=0.12,
+                background_color=get_color_from_hex('#006688' if lvl == 2 else '#333355'),
+            )
+            btn.bind(on_press=lambda inst, l=lvl: self._set_level(l))
+            header.add_widget(btn)
+            if lvl == 1:
+                self._l1_btn = btn
+            elif lvl == 2:
+                self._l2_btn = btn
+            else:
+                self._l3_btn = btn
+
         header.add_widget(Label(
             text='drag to rotate',
-            font_size=dp(11),
+            font_size=dp(10),
             color=DIM_COLOR,
-            size_hint_x=0.3,
+            size_hint_x=0.22,
         ))
         layout.add_widget(header)
 
@@ -1545,6 +1605,18 @@ class SpongeScreen(Screen):
             self.job_line.text = compute.job_label.text
         except Exception:
             pass
+
+    def _set_level(self, level):
+        """Change Menger sponge detail level."""
+        self.sponge.depth = level
+        self.sponge._build_sponge()
+        self.sponge._redraw()
+        # Highlight active button
+        inactive = get_color_from_hex('#333355')
+        active = get_color_from_hex('#006688')
+        self._l1_btn.background_color = active if level == 1 else inactive
+        self._l2_btn.background_color = active if level == 2 else inactive
+        self._l3_btn.background_color = active if level == 3 else inactive
 
     def _go_back(self, instance):
         App.get_running_app().root.current = 'compute'
@@ -2269,6 +2341,23 @@ class ComputeScreen(Screen):
                     self._log(f'Job {job_id}: submit failed ({code2})')
 
                 clear_checkpoint()
+
+                # Check for server alerts + updates after each job
+                try:
+                    vc, vdata = http_get_json(f"{self.server}/version")
+                    if vc == 200:
+                        alert = vdata.get('alert', '')
+                        if alert and alert != getattr(self, '_seen_alert', ''):
+                            self._seen_alert = alert
+                            self._log(f'[SERVER] {alert}')
+                            self._update_notification(f'Alert: {alert}')
+                        sv = vdata.get('exe_version', '')
+                        if sv and sv != VERSION and sv != getattr(self, '_seen_update', ''):
+                            self._seen_update = sv
+                            self._log(f'Update available: v{sv}')
+                            self._update_notification(f'Update available: v{sv}')
+                except Exception:
+                    pass
 
             except Exception as e:
                 self._log(f'Error: {e}')

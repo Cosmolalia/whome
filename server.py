@@ -608,10 +608,14 @@ def _client_version():
 
 @app.get("/version")
 def get_version():
-    """Return current client version hash + downloadable files."""
+    """Return current client version hash + downloadable files.
+    Set 'alert' to broadcast a message to all connected clients.
+    """
     return {
         "client_version": _client_version(),
-        "files": ["client.py", "w_operator.py"],
+        "exe_version": "1.0.2",
+        "alert": "",
+        "files": ["client.py", "w_operator.py", "whome_gui.py"],
     }
 
 @app.get("/clear", response_class=HTMLResponse)
@@ -733,10 +737,27 @@ def register_worker(req: RegisterRequest, request: Request):
         raise HTTPException(403, "Access denied")
 
     # Check if name is already taken
-    existing = conn.execute("SELECT id FROM workers WHERE name = ?", (req.name,)).fetchone()
+    existing = conn.execute("SELECT id, password_hash FROM workers WHERE name = ?", (req.name,)).fetchone()
     if existing:
+        if existing['password_hash']:
+            conn.close()
+            raise HTTPException(409, "Name already taken. Use /login to add a new device to your account.")
+        # Account exists but has no password (reset case) — let them set one
+        pw_hash = hash_password(req.password)
+        api_key = secrets.token_urlsafe(32)
+        now = time.time()
+        conn.execute("UPDATE workers SET password_hash = ?, last_heartbeat = ? WHERE id = ?",
+                     (pw_hash, now, existing['id']))
+        conn.execute(
+            "INSERT INTO api_keys (key_hash, worker_id, device_name, created_at, last_used) VALUES (?,?,?,?,?)",
+            (hash_key(api_key), existing['id'], req.device_name or "primary", now, now)
+        )
+        if req.gpu_info and req.gpu_info != 'chat-only':
+            conn.execute("UPDATE workers SET gpu_info = ? WHERE id = ?", (req.gpu_info, existing['id']))
+        _log_ip(conn, existing['id'], ip, "register-reset")
+        conn.commit()
         conn.close()
-        raise HTTPException(409, "Name already taken. Use /login to add a new device to your account.")
+        return {"worker_id": existing['id'], "api_key": api_key, "message": f"Password set for {req.name}."}
 
     worker_id = secrets.token_hex(8)
     api_key = secrets.token_urlsafe(32)
