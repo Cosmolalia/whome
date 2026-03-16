@@ -403,12 +403,21 @@ def solve_spectrum(L: "sp.csr_matrix", M: int, tol: float = 1e-10) -> np.ndarray
     if k < 2:
         vals = np.linalg.eigvalsh(L.toarray())
         return np.sort(np.real(vals))
+    # Deterministic initial vector — ARPACK's random v0 causes cross-platform divergence
+    v0 = np.ones(n, dtype=np.float64) / np.sqrt(n)
     try:
-        vals = spla.eigsh(L, k=k, which="SM", tol=tol, return_eigenvectors=False, maxiter=200000)
+        vals = spla.eigsh(L, k=k, which="SM", tol=tol, v0=v0, return_eigenvectors=False, maxiter=200000)
         return np.sort(np.real(vals))
     except Exception:
-        vals = spla.eigsh(L, k=k, sigma=0.0, which="LM", tol=tol, return_eigenvectors=False, maxiter=200000)
+        vals = spla.eigsh(L, k=k, sigma=0.0, which="LM", tol=tol, v0=v0, return_eigenvectors=False, maxiter=200000)
         return np.sort(np.real(vals))
+
+# --- Eigenvalue hashing (canonical — all clients must match) ---
+def hash_eigenvalues(eigs) -> str:
+    """Deterministic hash of eigenvalue array. Round to 10 decimals, sort, SHA-256."""
+    rounded = [round(float(e), 10) for e in sorted(eigs)]
+    payload = json.dumps(rounded, separators=(',', ':'))
+    return hashlib.sha256(payload.encode()).hexdigest()
 
 # --- Ratio protocol ---
 def select_I_gap(eigs_ref: np.ndarray, K_gap: int = 32, zero_tol: float = 1e-12) -> List[int]:

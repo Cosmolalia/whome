@@ -57,6 +57,12 @@ except ImportError:
     HAS_OPERATOR = False
 
 try:
+    from fractal_falsify import run_work_unit as falsify_work_unit
+    HAS_FALSIFY = True
+except ImportError:
+    HAS_FALSIFY = False
+
+try:
     import pystray
     from PIL import Image, ImageDraw
     HAS_TRAY = True
@@ -408,8 +414,10 @@ class ComputeWorker(threading.Thread):
                 params['job_id'] = job_id
                 progress = data.get('progress', {})
 
+                job_type = data.get('job_type', 'eigenvalue')
                 self.emit('job_start', {
-                    'job_id': job_id, 'lambda': params['lambda'],
+                    'job_id': job_id, 'lambda': params.get('lambda', 0),
+                    'job_type': job_type,
                     'params': params, 'progress': progress,
                 })
 
@@ -437,11 +445,19 @@ class ComputeWorker(threading.Thread):
 
                 # Submit result
                 eig_hash = hash_eigenvalues(eigs.tolist())
-                api_post(self.server, "/result", {
+                rcode, rdata = api_post(self.server, "/result", {
                     "job_id": job_id, "eigenvalues": eigs.tolist(),
                     "eigenvalues_hash": eig_hash,
                     "found_constants": hits, "compute_seconds": duration,
                 }, self.api_key)
+
+                if rcode == 200 and isinstance(rdata, dict):
+                    w_earned = rdata.get('w_minted', rdata.get('w_earned', 0))
+                    if w_earned:
+                        self.emit('w_earned', {
+                            'amount': w_earned,
+                            'job_id': job_id,
+                        })
 
                 # Check for updates + server alerts after each job
                 try:
@@ -472,6 +488,18 @@ class ComputeWorker(threading.Thread):
         self.emit('status', {'text': 'Worker stopped', 'state': 'idle'})
 
     def _run_job(self, params):
+        job_type = params.get('job_type', 'eigenvalue')
+
+        if job_type == 'falsification':
+            return self._run_falsification(params)
+        elif job_type == 'clock':
+            return self._run_eigenvalue(params)  # same computation, different tracking
+        elif job_type == 'boundary':
+            return self._run_boundary(params)
+        else:
+            return self._run_eigenvalue(params)
+
+    def _run_eigenvalue(self, params):
         k, G1, G2, S = params['k'], params['G1'], params['G2'], params['S']
         lam, w_glue, N = params['lambda'], params['w_glue'], 2
 
@@ -501,6 +529,61 @@ class ComputeWorker(threading.Thread):
         self._thermal_wait()
 
         self.emit('stage', {'num': 5, 'name': 'Solve Spectrum', 'detail': 'eigsh M=40'})
+        if HAS_GPU:
+            eigs = w_cuda.solve_spectrum_gpu(L, M=40)
+        else:
+            eigs = base_op.solve_spectrum(L, M=40)
+
+        clear_checkpoint()
+        return eigs
+
+    def _run_falsification(self, params):
+        """Run falsification job — test random 3D fractals against Menger predictions."""
+        seed = int(params.get('seed', params.get('lambda', 0)))
+        bases = params.get('bases', [3, 5, 7])
+        self.emit('stage', {'num': 1, 'name': 'Falsification', 'detail': f'seed={seed}'})
+        if HAS_FALSIFY:
+            result = falsify_work_unit(seed, b=bases[0], level=1)
+            if isinstance(result, dict) and 'eigenvalues' in result:
+                return np.array(result['eigenvalues'], dtype=np.float64)
+            return np.array([0.0], dtype=np.float64)
+        else:
+            return np.array([0.0], dtype=np.float64)
+
+    def _run_boundary(self, params):
+        """Run Howard Sphere boundary-only eigenvalue computation."""
+        k, G1, G2, S = params['k'], params['G1'], params['G2'], params['S']
+        lam, w_glue, N = params['lambda'], params['w_glue'], 2
+
+        self.emit('stage', {'num': 1, 'name': 'Build Graph (Boundary)', 'detail': f'k={k}'})
+        vertices, edges, b_ids = base_op.build_graph(k, G1, G2, S, N)
+        if self._stop.is_set(): return np.array([])
+
+        # Filter to boundary vertices only
+        boundary_set = set()
+        for bid in b_ids:
+            boundary_set.add(bid)
+        boundary_verts = {v: i for i, v in enumerate(sorted(boundary_set))}
+
+        self.emit('stage', {'num': 2, 'name': 'Add Glue (Boundary)', 'detail': f'\u03bb={lam:.6f}'})
+        upd, psi_by = base_op.add_glue_edges(vertices, b_ids, lam, w_glue, G1, G2)
+        edges_merged = base_op.merge_edges(edges, upd)
+        if self._stop.is_set(): return np.array([])
+
+        # Build boundary-only Laplacian: only edges between boundary vertices
+        self.emit('stage', {'num': 3, 'name': 'Boundary Laplacian',
+                            'detail': f'{len(boundary_verts)} boundary verts'})
+        boundary_edges = {(u, v): rec for (u, v), rec in edges_merged.items()
+                          if u in boundary_set and v in boundary_set}
+        if not boundary_edges:
+            return np.array([0.0], dtype=np.float64)
+
+        L, _ = base_op.build_magnetic_laplacian(
+            {v: vertices[v] for v in boundary_set}, boundary_edges,
+            s=(0, 0), psi_by_id=psi_by)
+        if self._stop.is_set(): return np.array([])
+
+        self.emit('stage', {'num': 4, 'name': 'Solve Boundary Spectrum', 'detail': 'eigsh M=40'})
         if HAS_GPU:
             eigs = w_cuda.solve_spectrum_gpu(L, M=40)
         else:
@@ -547,6 +630,12 @@ def setup_theme(root):
     style.map('Red.TButton', background=[('active', '#5a2a2a')])
     style.configure('TEntry', fieldbackground=C['surface2'], foreground=C['text'],
                     insertcolor=C['text'], borderwidth=1, padding=[4, 4])
+    style.configure('TCombobox', fieldbackground=C['surface2'], foreground=C['text'],
+                    selectbackground=C['btn'], selectforeground=C['text'])
+    style.configure('TLabelframe', background=C['bg'], foreground=C['cyan'],
+                    bordercolor=C['border'])
+    style.configure('TLabelframe.Label', background=C['bg'], foreground=C['cyan'],
+                    font=(MONO, 9))
     style.configure('TCheckbutton', background=C['bg'], foreground=C['text'])
     style.map('TCheckbutton', background=[('active', C['bg'])])
     style.configure('Cyan.Horizontal.TProgressbar',
@@ -984,6 +1073,276 @@ class ChatTab(ttk.Frame):
 # Settings Tab
 # ═══════════════════════════════════════════════════════════
 
+class WalletTab(ttk.Frame):
+    """W currency wallet — balance, transactions, staking controls."""
+
+    def __init__(self, parent, app):
+        super().__init__(parent)
+        self.app = app
+        self._build()
+
+    def _build(self):
+        # ── Header: Balance ──
+        header = ttk.Frame(self)
+        header.pack(fill='x', padx=14, pady=(14, 4))
+
+        ttk.Label(header, text="W WALLET", style='Title.TLabel').pack(
+            anchor='w')
+
+        bal_frame = ttk.Frame(self)
+        bal_frame.pack(fill='x', padx=14, pady=(4, 8))
+
+        self.balance_label = ttk.Label(bal_frame, text="0.0000",
+                                        style='Cyan.TLabel',
+                                        font=(MONO, 28, 'bold'))
+        self.balance_label.pack(side='left')
+        ttk.Label(bal_frame, text="  W", style='Dim.TLabel',
+                  font=(MONO, 18)).pack(side='left', pady=(8, 0))
+
+        # Sub-stats row
+        sub = ttk.Frame(self)
+        sub.pack(fill='x', padx=14, pady=(0, 12))
+        self.earned_label = ttk.Label(sub, text="Earned: --",
+                                       style='Dim.TLabel', font=(MONO, 9))
+        self.earned_label.pack(side='left')
+        self.staked_label = ttk.Label(sub, text="  |  Staked: --",
+                                       style='Dim.TLabel', font=(MONO, 9))
+        self.staked_label.pack(side='left')
+        self.sent_label = ttk.Label(sub, text="  |  Sent: --",
+                                     style='Dim.TLabel', font=(MONO, 9))
+        self.sent_label.pack(side='left')
+        self.received_label = ttk.Label(sub, text="  |  Received: --",
+                                         style='Dim.TLabel', font=(MONO, 9))
+        self.received_label.pack(side='left')
+
+        # ── Two columns: Transactions + Staking ──
+        cols = ttk.Frame(self)
+        cols.pack(fill='both', expand=True, padx=14, pady=(0, 8))
+        cols.columnconfigure(0, weight=2)
+        cols.columnconfigure(1, weight=1)
+
+        # Left: Transactions
+        left = ttk.Frame(cols)
+        left.grid(row=0, column=0, sticky='nsew', padx=(0, 6))
+        ttk.Label(left, text="Recent Transactions", style='Dim.TLabel',
+                  font=(MONO, 9)).pack(anchor='w', pady=(0, 4))
+
+        self.tx_tree = ttk.Treeview(left,
+                                     columns=('time', 'type', 'amount', 'with', 'memo'),
+                                     show='headings', height=10)
+        self.tx_tree.heading('time', text='Time')
+        self.tx_tree.heading('type', text='Type')
+        self.tx_tree.heading('amount', text='Amount')
+        self.tx_tree.heading('with', text='From/To')
+        self.tx_tree.heading('memo', text='Memo')
+        self.tx_tree.column('time', width=70, anchor='center')
+        self.tx_tree.column('type', width=50, anchor='center')
+        self.tx_tree.column('amount', width=60, anchor='e')
+        self.tx_tree.column('with', width=80)
+        self.tx_tree.column('memo', width=120)
+        self.tx_tree.pack(fill='both', expand=True)
+
+        # Right: Staking
+        right = ttk.Frame(cols)
+        right.grid(row=0, column=1, sticky='nsew', padx=(6, 0))
+        ttk.Label(right, text="Staking", style='Dim.TLabel',
+                  font=(MONO, 9)).pack(anchor='w', pady=(0, 4))
+
+        # Active stakes list
+        self.stake_tree = ttk.Treeview(right,
+                                        columns=('type', 'amount', 'since'),
+                                        show='headings', height=5)
+        self.stake_tree.heading('type', text='Job Type')
+        self.stake_tree.heading('amount', text='W Staked')
+        self.stake_tree.heading('since', text='Since')
+        self.stake_tree.column('type', width=80)
+        self.stake_tree.column('amount', width=60, anchor='e')
+        self.stake_tree.column('since', width=70, anchor='center')
+        self.stake_tree.pack(fill='both', expand=True, pady=(0, 6))
+
+        # Stake controls
+        stake_ctl = ttk.Frame(right)
+        stake_ctl.pack(fill='x', pady=(0, 4))
+        ttk.Label(stake_ctl, text="Type:", style='Dim.TLabel',
+                  font=(MONO, 9)).pack(side='left')
+        self.stake_type = ttk.Combobox(stake_ctl, values=[
+            'eigenvalue', 'falsification', 'clock'
+        ], width=12, state='readonly', font=(MONO, 9))
+        self.stake_type.set('eigenvalue')
+        self.stake_type.pack(side='left', padx=4)
+        ttk.Label(stake_ctl, text="W:", style='Dim.TLabel',
+                  font=(MONO, 9)).pack(side='left')
+        self.stake_amount = ttk.Entry(stake_ctl, width=8, font=(MONO, 9))
+        self.stake_amount.pack(side='left', padx=4)
+        ttk.Button(stake_ctl, text="Stake", style='Green.TButton',
+                   command=self._stake).pack(side='left', padx=2)
+
+        # Unstake button
+        ttk.Button(right, text="Unstake Selected", style='TButton',
+                   command=self._unstake).pack(anchor='w', pady=(0, 6))
+
+        # ── Transfer controls ──
+        xfer = ttk.LabelFrame(self, text="  Transfer W  ")
+        xfer.pack(fill='x', padx=14, pady=(4, 8))
+
+        xfer_row = ttk.Frame(xfer)
+        xfer_row.pack(fill='x', padx=8, pady=6)
+        ttk.Label(xfer_row, text="To:", style='Dim.TLabel',
+                  font=(MONO, 9)).pack(side='left')
+        self.xfer_to = ttk.Entry(xfer_row, width=20, font=(MONO, 9))
+        self.xfer_to.pack(side='left', padx=4)
+        ttk.Label(xfer_row, text="Amount:", style='Dim.TLabel',
+                  font=(MONO, 9)).pack(side='left')
+        self.xfer_amount = ttk.Entry(xfer_row, width=10, font=(MONO, 9))
+        self.xfer_amount.pack(side='left', padx=4)
+        ttk.Label(xfer_row, text="Memo:", style='Dim.TLabel',
+                  font=(MONO, 9)).pack(side='left')
+        self.xfer_memo = ttk.Entry(xfer_row, width=20, font=(MONO, 9))
+        self.xfer_memo.pack(side='left', padx=4)
+        ttk.Button(xfer_row, text="Send", style='Green.TButton',
+                   command=self._transfer).pack(side='left', padx=4)
+
+        self.xfer_status = ttk.Label(xfer, text="", style='Dim.TLabel',
+                                      font=(MONO, 9))
+        self.xfer_status.pack(anchor='w', padx=8, pady=(0, 6))
+
+        # ── Economy overview ──
+        econ = ttk.Frame(self)
+        econ.pack(fill='x', padx=14, pady=(0, 8))
+        self.econ_label = ttk.Label(econ,
+                                     text="Network: -- W minted  |  -- W staked  |  -- W/hr minting rate",
+                                     style='Dim.TLabel', font=(MONO, 9))
+        self.econ_label.pack(anchor='w')
+
+    def update_wallet(self, data):
+        """Update wallet display from /wallet API response."""
+        balance = data.get('balance', 0)
+        self.balance_label.config(text=f"{balance:.4f}")
+        self.earned_label.config(text=f"Earned: {data.get('total_earned', 0):.4f}")
+        self.staked_label.config(text=f"  |  Staked: {data.get('staked', 0):.4f}")
+        self.sent_label.config(text=f"  |  Sent: {data.get('total_sent', 0):.4f}")
+        self.received_label.config(
+            text=f"  |  Received: {data.get('total_received', 0):.4f}")
+
+        # Update transactions
+        for item in self.tx_tree.get_children():
+            self.tx_tree.delete(item)
+        for tx in data.get('transactions', [])[:20]:
+            ts = tx.get('timestamp', '')[:16]
+            tx_type = tx.get('tx_type', '?')
+            amount = tx.get('amount', 0)
+            # Show from/to depending on type
+            other = tx.get('to_name', '') if tx_type == 'send' else tx.get('from_name', '')
+            memo = tx.get('memo', '')[:30]
+            amount_str = f"+{amount:.4f}" if tx_type in ('mint', 'receive') else f"-{amount:.4f}"
+            self.tx_tree.insert('', 'end',
+                                values=(ts, tx_type, amount_str, other, memo))
+
+        # Update stakes
+        for item in self.stake_tree.get_children():
+            self.stake_tree.delete(item)
+        for s in data.get('stakes', []):
+            self.stake_tree.insert('', 'end', values=(
+                s.get('job_type', '?'),
+                f"{s.get('amount', 0):.4f}",
+                s.get('staked_at', '')[:10],
+            ), tags=(str(s.get('id', '')),))
+
+    def update_economy(self, data):
+        """Update economy overview from /economy API response."""
+        minted = data.get('total_minted', 0)
+        staked = data.get('total_staked', 0)
+        rate = data.get('minting_rate_per_hour', 0)
+        self.econ_label.config(
+            text=f"Network: {minted:.2f} W minted  |  {staked:.2f} W staked  |  {rate:.2f} W/hr minting rate")
+
+    def _transfer(self):
+        """Send W to another user."""
+        to = self.xfer_to.get().strip()
+        amount_str = self.xfer_amount.get().strip()
+        memo = self.xfer_memo.get().strip()
+
+        if not to or not amount_str:
+            self.xfer_status.config(text="Enter recipient and amount",
+                                     style='Red.TLabel')
+            return
+
+        try:
+            amount = float(amount_str)
+        except ValueError:
+            self.xfer_status.config(text="Invalid amount", style='Red.TLabel')
+            return
+
+        self.xfer_status.config(text="Sending...", style='Dim.TLabel')
+
+        def _do():
+            try:
+                code, result = api_post(self.app.server, "/transfer", {
+                    "to_name": to, "amount": amount, "memo": memo
+                }, self.app.api_key)
+                if code == 200:
+                    new_bal = result.get('new_balance', '?')
+                    self.app.root.after(0, lambda: self.xfer_status.config(
+                        text=f"Sent {amount:.4f} W to {to}. Balance: {new_bal}",
+                        style='Green.TLabel'))
+                    self.app.root.after(0, lambda: self.xfer_to.delete(0, 'end'))
+                    self.app.root.after(0, lambda: self.xfer_amount.delete(0, 'end'))
+                    self.app.root.after(0, lambda: self.xfer_memo.delete(0, 'end'))
+                else:
+                    msg = result.get('detail', 'Transfer failed') if isinstance(result, dict) else str(result)
+                    self.app.root.after(0, lambda m=msg: self.xfer_status.config(
+                        text=m, style='Red.TLabel'))
+            except Exception as e:
+                self.app.root.after(0, lambda: self.xfer_status.config(
+                    text=str(e), style='Red.TLabel'))
+
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _stake(self):
+        """Stake W on a job type."""
+        job_type = self.stake_type.get()
+        amount_str = self.stake_amount.get().strip()
+        if not amount_str:
+            return
+        try:
+            amount = float(amount_str)
+        except ValueError:
+            return
+
+        def _do():
+            try:
+                code, result = api_post(self.app.server, "/stake", {
+                    "job_type": job_type, "amount": amount
+                }, self.app.api_key)
+                if code == 200:
+                    self.app.root.after(0, lambda: self.stake_amount.delete(0, 'end'))
+            except Exception:
+                pass
+
+        threading.Thread(target=_do, daemon=True).start()
+
+    def _unstake(self):
+        """Unstake selected stake."""
+        sel = self.stake_tree.selection()
+        if not sel:
+            return
+        item = sel[0]
+        tags = self.stake_tree.item(item, 'tags')
+        if not tags:
+            return
+        stake_id = tags[0]
+
+        def _do():
+            try:
+                api_post(self.app.server, "/unstake", {
+                    "stake_id": int(stake_id)
+                }, self.app.api_key)
+            except Exception:
+                pass
+
+        threading.Thread(target=_do, daemon=True).start()
+
+
 class SettingsTab(ttk.Frame):
     def __init__(self, parent, app):
         super().__init__(parent)
@@ -1243,6 +1602,7 @@ class WHomeApp:
         self.tray = None
         self._pending_alert = None  # unread server alert message
         self._tray_state = 'idle'   # current tray icon state for redraw
+        self._shutting_down = False  # set True on quit — stops pollers
         self._compute_start_time = None  # tracks when current job started
         self._session_jobs = 0
         self._session_hours = 0.0
@@ -1441,11 +1801,13 @@ class WHomeApp:
 
         self.compute_tab = ComputeTab(self.notebook, self)
         self.dashboard_tab = DashboardTab(self.notebook, self)
+        self.wallet_tab = WalletTab(self.notebook, self)
         self.chat_tab = ChatTab(self.notebook, self)
         self.settings_tab = SettingsTab(self.notebook, self)
 
         self.notebook.add(self.compute_tab, text='  Compute  ')
         self.notebook.add(self.dashboard_tab, text='  Dashboard  ')
+        self.notebook.add(self.wallet_tab, text='  W Wallet  ')
         self.notebook.add(self.chat_tab, text='  Chat  ')
         self.notebook.add(self.settings_tab, text='  Settings  ')
 
@@ -1519,11 +1881,23 @@ class WHomeApp:
 
     def _on_close(self):
         if HAS_TRAY and self.config.get('minimize_to_tray', True):
+            # On Linux, tray icons are unreliable — verify tray is actually visible
+            if sys.platform == 'linux' and self.tray:
+                try:
+                    # pystray sets .visible when icon is successfully shown
+                    if not getattr(self.tray, 'visible', False):
+                        self._quit()
+                        return
+                except Exception:
+                    pass
             self.root.withdraw()
         else:
             self._quit()
 
     def _quit(self, icon=None, item=None):
+        if self._shutting_down:
+            return  # prevent re-entry
+        self._shutting_down = True
         if self.worker:
             self.worker.stop()
         if self.tray:
@@ -1531,7 +1905,16 @@ class WHomeApp:
                 self.tray.stop()
             except Exception:
                 pass
-        self.root.after(0, self.root.destroy)
+        # Force-exit watchdog: if destroy doesn't kill us in 3s, hard exit
+        # (handles uninterruptible eigensolver blocking a thread)
+        def _force_exit():
+            time.sleep(3)
+            os._exit(0)
+        threading.Thread(target=_force_exit, daemon=True).start()
+        try:
+            self.root.after(0, self.root.destroy)
+        except Exception:
+            os._exit(0)
 
     # ── Compute controls ──
 
@@ -1550,7 +1933,7 @@ class WHomeApp:
         if self.worker:
             self.worker.stop()
             self.compute_tab.set_computing(False)
-            self.compute_tab.set_status("Stopping...")
+            self.compute_tab.set_status("Stopping (finishes current computation)...")
             self._update_tray_icon('idle')
 
     def toggle_pause(self, icon=None, item=None):
@@ -1587,6 +1970,8 @@ class WHomeApp:
     # ── Queue polling ──
 
     def _poll_queue(self):
+        if self._shutting_down:
+            return
         try:
             while True:
                 event, data = self.msg_queue.get_nowait()
@@ -1710,6 +2095,13 @@ class WHomeApp:
             if msg:
                 tab.log_msg(f"[SERVER] {msg}", 'gold')
                 self._set_alert(msg)
+        elif event == 'w_earned':
+            amount = data.get('amount', 0)
+            job_id = data.get('job_id', '?')
+            tab.log_msg(f"  +{amount:.4f} W earned (job #{job_id})", 'gold')
+            self._session_w = getattr(self, '_session_w', 0) + amount
+            self.session_text.config(
+                text=f"{self._session_jobs} jobs | {self._session_hours:.2f}h | {self._session_w:.4f} W")
         elif event == 'error':
             tab.log_msg(data.get('text', 'Unknown error'), 'error')
             self._update_tray_icon('error')
@@ -1721,18 +2113,18 @@ class WHomeApp:
     def _start_pollers(self):
         # Dashboard poller
         def poll_dashboard():
-            while True:
+            while not self._shutting_down:
                 try:
                     code, progress = api_get(self.server, "/progress", self.api_key)
-                    if code == 200:
+                    if code == 200 and not self._shutting_down:
                         self.root.after(0, self.dashboard_tab.update_progress, progress)
 
                     code, disc = api_get(self.server, "/discoveries", self.api_key)
-                    if code == 200 and isinstance(disc, list):
+                    if code == 200 and isinstance(disc, list) and not self._shutting_down:
                         self.root.after(0, self.dashboard_tab.update_discoveries, disc)
 
                     code, leaders = api_get(self.server, "/leaderboard", self.api_key)
-                    if code == 200 and isinstance(leaders, list):
+                    if code == 200 and isinstance(leaders, list) and not self._shutting_down:
                         self.root.after(0, self.dashboard_tab.update_leaderboard, leaders)
                 except Exception:
                     pass
@@ -1742,11 +2134,31 @@ class WHomeApp:
 
         # Chat poller
         def poll_chat():
-            while True:
-                self.chat_tab.poll_messages()
+            while not self._shutting_down:
+                try:
+                    self.chat_tab.poll_messages()
+                except Exception:
+                    pass
                 time.sleep(3)
 
         threading.Thread(target=poll_chat, daemon=True).start()
+
+        # Wallet poller
+        def poll_wallet():
+            while not self._shutting_down:
+                try:
+                    code, wallet = api_get(self.server, "/wallet", self.api_key)
+                    if code == 200 and isinstance(wallet, dict) and not self._shutting_down:
+                        self.root.after(0, self.wallet_tab.update_wallet, wallet)
+
+                    code, economy = api_get(self.server, "/api/economy")
+                    if code == 200 and isinstance(economy, dict) and not self._shutting_down:
+                        self.root.after(0, self.wallet_tab.update_economy, economy)
+                except Exception:
+                    pass
+                time.sleep(10)
+
+        threading.Thread(target=poll_wallet, daemon=True).start()
 
     def run(self):
         self.root.mainloop()
@@ -1783,6 +2195,7 @@ def _ensure_single_instance():
 
 
 def main():
+    import signal
     _instance_lock = _ensure_single_instance()
 
     # Set low process priority on Windows
@@ -1797,6 +2210,13 @@ def main():
         pass
 
     app = WHomeApp()
+
+    # Handle Ctrl+C and kill signals cleanly
+    def _sig_quit(sig, frame):
+        app._quit()
+    signal.signal(signal.SIGINT, _sig_quit)
+    signal.signal(signal.SIGTERM, _sig_quit)
+
     app.run()
 
 def _is_screensaver_mode():
@@ -1846,3 +2266,710 @@ if __name__ == '__main__':
             messagebox.showerror("W@Home Error", str(e))
             if getattr(sys, 'frozen', False):
                 input("Press Enter to exit...")
+"""
+W@Home Client — Volunteer Spectral Search Worker
+
+Pulls jobs from the Hive server, computes eigenvalue spectra of the
+W-operator on Menger sponge boundary graphs, and reports discoveries.
+
+Features (BOINC/SETI lessons):
+- Checkpoint/resume: saves progress to disk, survives pause/reboot
+- Integrity hashing: SHA256 of eigenvalues for corruption detection
+- Rich terminal display: shows what you're computing and why
+- Heartbeat: keeps server informed you're alive
+- Exponential backoff: gentle on the server when things go wrong
+- Screensaver mode: --screensaver flag for visual display
+- Nice priority: runs at low CPU priority by default
+
+Usage:
+    python client.py                    # First run — registers with Hive
+    python client.py --key YOUR_KEY     # Resume with existing API key
+    python client.py --screensaver      # Visual screensaver mode
+    python client.py --name "MyPC"      # Set volunteer name
+"""
+
+import requests
+import time
+import json
+import hashlib
+import os
+import sys
+import signal
+import argparse
+import threading
+import numpy as np
+
+# ═══════════════════════════════════════════════════════════
+# Configuration
+# ═══════════════════════════════════════════════════════════
+
+SERVER_URL = os.environ.get("HIVE_SERVER", "https://wathome.akataleptos.com")
+CONFIG_PATH = os.path.join(os.path.dirname(__file__), "worker_config.json")
+CHECKPOINT_PATH = os.path.join(os.path.dirname(__file__), "checkpoint.json")
+RECEIPTS_PATH = os.path.join(os.path.dirname(__file__), "receipts.jsonl")
+
+# Physical constants we're hunting
+CONSTANTS = {
+    "phi":              1.6180339887,
+    "e":                2.718281828,
+    "pi":               3.141592653,
+    "alpha_inv":        137.035999,
+    "proton_electron":  1836.15267,
+    "sqrt2":            1.4142135624,
+    "sqrt3":            1.7320508076,
+    "ln2":              0.6931471806,
+}
+TOLERANCE = 1e-4
+
+# Backoff
+MIN_BACKOFF = 2
+MAX_BACKOFF = 120
+
+# ═══════════════════════════════════════════════════════════
+# GPU Detection
+# ═══════════════════════════════════════════════════════════
+
+try:
+    import w_cuda
+    HAS_GPU = w_cuda.HAS_GPU
+    GPU_INFO = "CUDA (CuPy)"
+except ImportError:
+    HAS_GPU = False
+    GPU_INFO = "CPU"
+
+try:
+    import w_operator as base_op
+except ImportError:
+    print("[!] Cannot import w_operator — make sure w_operator.py is in the same directory")
+    sys.exit(1)
+
+# ═══════════════════════════════════════════════════════════
+# Config persistence
+# ═══════════════════════════════════════════════════════════
+
+def load_config():
+    if os.path.exists(CONFIG_PATH):
+        with open(CONFIG_PATH) as f:
+            return json.load(f)
+    return {}
+
+def save_config(cfg):
+    with open(CONFIG_PATH, 'w') as f:
+        json.dump(cfg, f, indent=2)
+
+def save_checkpoint(data):
+    with open(CHECKPOINT_PATH, 'w') as f:
+        json.dump(data, f, indent=2)
+
+def load_checkpoint():
+    if os.path.exists(CHECKPOINT_PATH):
+        with open(CHECKPOINT_PATH) as f:
+            return json.load(f)
+    return None
+
+def clear_checkpoint():
+    if os.path.exists(CHECKPOINT_PATH):
+        os.remove(CHECKPOINT_PATH)
+
+# ═══════════════════════════════════════════════════════════
+# Auto-update
+# ═══════════════════════════════════════════════════════════
+
+def _self_hash():
+    """SHA256 of this client.py file (first 16 hex chars)."""
+    me = os.path.abspath(__file__)
+    with open(me, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()[:16]
+
+def check_for_update():
+    """Check server for newer client version. Returns True if updated (needs restart)."""
+    try:
+        resp = requests.get(f"{SERVER_URL}/version", timeout=10)
+        if resp.status_code != 200:
+            return False
+        info = resp.json()
+        server_ver = info.get("client_version", "")
+        local_ver = _self_hash()
+        if server_ver == local_ver or not server_ver or server_ver == "unknown":
+            return False
+
+        # New version available — download updated files
+        my_dir = os.path.dirname(os.path.abspath(__file__))
+        files = info.get("files", ["client.py", "w_operator.py"])
+        for fname in files:
+            url = f"{SERVER_URL}/static/{fname}"
+            r = requests.get(url, timeout=30)
+            if r.status_code == 200:
+                target = os.path.join(my_dir, fname)
+                # Backup current
+                if os.path.exists(target):
+                    backup = target + ".bak"
+                    try:
+                        os.replace(target, backup)
+                    except OSError:
+                        pass
+                with open(target, "w") as f:
+                    f.write(r.text)
+        return True
+    except Exception:
+        return False
+
+# ═══════════════════════════════════════════════════════════
+# Hashing
+# ═══════════════════════════════════════════════════════════
+
+def hash_eigenvalues(eigs):
+    rounded = [round(float(e), 10) for e in sorted(eigs)]
+    payload = json.dumps(rounded, separators=(',', ':'))
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+def save_receipt(receipt):
+    """Append a signed receipt to the local receipts ledger."""
+    try:
+        with open(RECEIPTS_PATH, 'a') as f:
+            f.write(json.dumps(receipt) + '\n')
+    except Exception:
+        pass  # Non-critical — don't crash over receipt saving
+
+# ═══════════════════════════════════════════════════════════
+# Constant detection
+# ═══════════════════════════════════════════════════════════
+
+def check_for_gold(eigs):
+    eigs = np.sort(eigs[eigs > 1e-9])
+    found = []
+    n = len(eigs)
+    # Check pairwise ratios (cap at first 60 eigenvalues to stay O(n^2) manageable)
+    cap = min(n, 60)
+    for i in range(cap):
+        for j in range(i + 1, cap):
+            ratio = eigs[j] / eigs[i]
+            for name, val in CONSTANTS.items():
+                if abs(ratio - val) / val < TOLERANCE:
+                    found.append(f"{name} (ratio={ratio:.6f}, i={i}, j={j})")
+    return found
+
+# ═══════════════════════════════════════════════════════════
+# Terminal display
+# ═══════════════════════════════════════════════════════════
+
+class Display:
+    """Rich terminal output showing computation progress."""
+
+    CLEAR_LINE = '\033[2K\r'
+    CYAN = '\033[96m'
+    GOLD = '\033[93m'
+    VIOLET = '\033[95m'
+    GREEN = '\033[92m'
+    RED = '\033[91m'
+    DIM = '\033[90m'
+    BOLD = '\033[1m'
+    RESET = '\033[0m'
+
+    def __init__(self):
+        self.job_id = None
+        self.lambda_val = None
+        self.stage = ""
+        self.stage_num = 0
+        self.total_stages = 5
+        self.stats = {}
+        self.worker_stats = {"jobs": 0, "discoveries": 0, "compute_hrs": 0}
+
+    def banner(self, worker_id, gpu_info):
+        print(f"""
+{self.CYAN}╔══════════════════════════════════════════════════════════╗
+║  {self.BOLD}W@HOME HIVE — Akataleptos Spectral Search{self.RESET}{self.CYAN}             ║
+║  {self.DIM}Searching for the universe in eigenvalue ratios{self.RESET}{self.CYAN}        ║
+╚══════════════════════════════════════════════════════════╝{self.RESET}
+  {self.DIM}Worker:{self.RESET} {worker_id}
+  {self.DIM}Compute:{self.RESET} {gpu_info}
+  {self.DIM}Server:{self.RESET} {SERVER_URL}
+""")
+
+    def show_progress(self, stats=None):
+        if stats:
+            self.stats = stats
+
+        # Build progress bar
+        pct = self.stats.get('percent_complete', 0)
+        bar_w = 40
+        filled = int(bar_w * pct / 100)
+        bar = f"{self.CYAN}{'█' * filled}{self.DIM}{'░' * (bar_w - filled)}{self.RESET}"
+
+        workers = self.stats.get('active_workers', 0)
+        disc = self.stats.get('total_discoveries', 0)
+
+        print(f"\n  {self.VIOLET}HIVE STATUS{self.RESET}")
+        print(f"  [{bar}] {pct:.2f}%")
+        print(f"  {self.DIM}Workers:{self.RESET} {workers}  "
+              f"{self.DIM}Jobs/hr:{self.RESET} {self.stats.get('jobs_per_hour', 0)}  "
+              f"{self.DIM}Discoveries:{self.RESET} {self.GOLD}{disc}{self.RESET}")
+
+        eta = self.stats.get('eta_hours')
+        if eta:
+            print(f"  {self.DIM}ETA:{self.RESET} {eta}h")
+        print()
+
+    def show_job(self, job_id, lambda_val, params):
+        self.job_id = job_id
+        self.lambda_val = lambda_val
+        self.stage_num = 0
+
+        print(f"  {self.CYAN}═══ Job {job_id} ═══{self.RESET}")
+        print(f"  {self.DIM}Lambda:{self.RESET}  {self.GOLD}{lambda_val:.6f}{self.RESET}")
+        print(f"  {self.DIM}Level:{self.RESET}   k={params.get('k', '?')}  "
+              f"{self.DIM}Grid:{self.RESET} {params.get('G1', '?')}×{params.get('G2', '?')}  "
+              f"{self.DIM}Circle:{self.RESET} S={params.get('S', '?')}")
+        print()
+
+    def show_stage(self, name, detail=""):
+        self.stage_num += 1
+        self.stage = name
+        stages = ['Build Graph', 'Add Glue', 'Merge Edges', 'Build Laplacian', 'Solve Spectrum']
+        markers = ""
+        for i, s in enumerate(stages):
+            if i + 1 < self.stage_num:
+                markers += f"{self.GREEN}●{self.RESET} "
+            elif i + 1 == self.stage_num:
+                markers += f"{self.CYAN}◉{self.RESET} "
+            else:
+                markers += f"{self.DIM}○{self.RESET} "
+
+        print(f"  {markers} {self.CYAN}{name}{self.RESET} {self.DIM}{detail}{self.RESET}")
+
+    def show_result(self, hits, eigs, duration):
+        n_eigs = len(eigs[eigs > 1e-9]) if isinstance(eigs, np.ndarray) else 0
+
+        if hits:
+            print(f"\n  {self.GOLD}{'═' * 50}")
+            print(f"  ★ RESONANCE DETECTED ★")
+            for h in hits:
+                print(f"    {h}")
+            print(f"  {'═' * 50}{self.RESET}\n")
+        else:
+            print(f"  {self.GREEN}●●●●●{self.RESET} {self.DIM}Complete{self.RESET}  "
+                  f"{n_eigs} eigenvalues  {duration:.1f}s  "
+                  f"{self.DIM}no constants in ratios{self.RESET}")
+
+        self.worker_stats['jobs'] += 1
+        self.worker_stats['compute_hrs'] += duration / 3600
+        print(f"  {self.DIM}Session: {self.worker_stats['jobs']} jobs, "
+              f"{self.worker_stats['compute_hrs']:.2f}h compute, "
+              f"{self.worker_stats['discoveries']} discoveries{self.RESET}")
+        print()
+
+    def show_error(self, msg):
+        print(f"  {self.RED}[!] {msg}{self.RESET}")
+
+    def show_info(self, msg):
+        print(f"  {self.DIM}{msg}{self.RESET}")
+
+    def show_waiting(self, backoff):
+        print(f"  {self.DIM}Waiting {backoff:.0f}s before retry...{self.RESET}")
+
+# ═══════════════════════════════════════════════════════════
+# Computation (with checkpointing)
+# ═══════════════════════════════════════════════════════════
+
+def run_job_with_stages(params, display, checkpoint=None):
+    """Run eigenvalue computation with per-stage progress and checkpointing."""
+    k = params['k']
+    G1, G2 = params['G1'], params['G2']
+    S = params['S']
+    lam = params['lambda']
+    w_glue = params['w_glue']
+    N = 2
+
+    # Stage 1: Build Graph
+    if checkpoint and checkpoint.get('stage', 0) >= 1:
+        display.show_stage("Build Graph", "(cached)")
+        # Can't cache graph easily (too large), rebuild
+    display.show_stage("Build Graph", f"k={k} boundary cubes")
+    vertices, edges, b_ids = base_op.build_graph(k, G1, G2, S, N)
+    save_checkpoint({'job_id': params.get('job_id'), 'stage': 1, 'params': params})
+
+    # Stage 2: Add Glue
+    display.show_stage("Add Glue", f"λ={lam:.6f} w={w_glue}")
+    upd, psi_by = base_op.add_glue_edges(vertices, b_ids, lam, w_glue, G1, G2)
+    save_checkpoint({'job_id': params.get('job_id'), 'stage': 2, 'params': params})
+
+    # Stage 3: Merge Edges
+    display.show_stage("Merge Edges", f"{len(edges):,} + {len(upd):,} glue")
+    edges_merged = base_op.merge_edges(edges, upd)
+
+    # Stage 4: Build Laplacian
+    display.show_stage("Build Laplacian", f"{len(vertices):,} vertices")
+    L, _ = base_op.build_magnetic_laplacian(vertices, edges_merged, s=(0, 0), psi_by_id=psi_by)
+    save_checkpoint({'job_id': params.get('job_id'), 'stage': 4, 'params': params})
+
+    # Stage 5: Solve Spectrum
+    display.show_stage("Solve Spectrum", "eigsh M=40")
+    if HAS_GPU:
+        eigs = w_cuda.solve_spectrum_gpu(L, M=40)
+    else:
+        eigs = base_op.solve_spectrum(L, M=40)
+
+    clear_checkpoint()
+    return eigs
+
+# ═══════════════════════════════════════════════════════════
+# Heartbeat thread
+# ═══════════════════════════════════════════════════════════
+
+def heartbeat_loop(api_key, interval=120):
+    """Send heartbeat to server every N seconds."""
+    while True:
+        try:
+            requests.post(
+                f"{SERVER_URL}/heartbeat",
+                headers={"x-api-key": api_key},
+                timeout=10
+            )
+        except Exception:
+            pass
+        time.sleep(interval)
+
+# ═══════════════════════════════════════════════════════════
+# Registration
+# ═══════════════════════════════════════════════════════════
+
+def register(name, gpu_info, password=""):
+    """Register with the Hive, get API key."""
+    import platform
+    device_name = platform.node()
+    resp = requests.post(f"{SERVER_URL}/register", json={
+        "name": name,
+        "gpu_info": gpu_info,
+        "password": password,
+        "device_name": device_name,
+    })
+    if resp.status_code == 409:
+        # Name taken — offer to login instead
+        raise NameTakenError(resp.json().get('detail', 'Name already taken'))
+    if resp.status_code != 200:
+        raise RuntimeError(f"Registration failed: {resp.text}")
+    data = resp.json()
+    cfg = load_config()
+    cfg['api_key'] = data['api_key']
+    cfg['worker_id'] = data['worker_id']
+    cfg['name'] = name
+    cfg['server'] = SERVER_URL
+    save_config(cfg)
+    return data['api_key'], data['worker_id']
+
+
+class NameTakenError(Exception):
+    pass
+
+
+def login(name, password):
+    """Login to existing account from a new device, get fresh API key."""
+    import platform
+    device_name = platform.node()
+    resp = requests.post(f"{SERVER_URL}/login", json={
+        "name": name,
+        "password": password,
+        "device_name": device_name,
+        "gpu_info": GPU_INFO,
+    })
+    if resp.status_code != 200:
+        detail = ""
+        try:
+            detail = resp.json().get('detail', resp.text)
+        except Exception:
+            detail = resp.text
+        raise RuntimeError(f"Login failed: {detail}")
+    data = resp.json()
+    cfg = load_config()
+    cfg['api_key'] = data['api_key']
+    cfg['worker_id'] = data['worker_id']
+    cfg['name'] = name
+    cfg['server'] = SERVER_URL
+    save_config(cfg)
+    return data['api_key'], data['worker_id']
+
+# ═══════════════════════════════════════════════════════════
+# Main loop
+# ═══════════════════════════════════════════════════════════
+
+def interactive_setup(cfg):
+    """First-run wizard when double-clicked without arguments."""
+    print("")
+    print("  \033[96m╔══════════════════════════════════════════════════════════╗")
+    print("  ║  \033[1mW@HOME HIVE\033[0m\033[96m — First-Time Setup                         ║")
+    print("  ╚══════════════════════════════════════════════════════════╝\033[0m")
+    print("")
+    print("  Welcome! Let's get you set up to contribute.\n")
+
+    # Name
+    import platform
+    default_name = f"{platform.node()}-{os.getenv('USER', os.getenv('USERNAME', 'worker'))}"
+    name = input(f"  Your node name [{default_name}]: ").strip()
+    if not name:
+        name = default_name
+    print(f"  \033[92m✓\033[0m Name: {name}\n")
+
+    # Password
+    import getpass
+    print("  Password protects your account so others can't use your name.")
+    print("  You'll use this password to log in from additional devices.\n")
+    while True:
+        pw = getpass.getpass("  Password (min 4 chars): ")
+        if len(pw) >= 4:
+            pw2 = getpass.getpass("  Confirm password: ")
+            if pw == pw2:
+                break
+            print("  \033[91mPasswords don't match. Try again.\033[0m\n")
+        else:
+            print("  \033[91mToo short. Minimum 4 characters.\033[0m\n")
+    print(f"  \033[92m✓\033[0m Password set\n")
+
+    # Server
+    default_server = cfg.get('server', "https://wathome.akataleptos.com")
+    server = input(f"  Hive server [{default_server}]: ").strip()
+    if not server:
+        server = default_server
+    print(f"  \033[92m✓\033[0m Server: {server}\n")
+
+    cfg['name'] = name
+    cfg['server'] = server
+    return name, server, pw
+
+def main():
+    parser = argparse.ArgumentParser(description="W@Home Hive Worker")
+    parser.add_argument("--key", help="API key (or auto-load from config)")
+    parser.add_argument("--name", default="", help="Volunteer name")
+    parser.add_argument("--server", default=None, help="Hive server URL")
+    parser.add_argument("--login", action="store_true", help="Log in to existing account on new device")
+    parser.add_argument("--screensaver", action="store_true", help="Run in screensaver mode")
+    parser.add_argument("--nice", type=int, default=10, help="Process nice level (0-19)")
+    args = parser.parse_args()
+
+    global SERVER_URL
+    cfg = load_config()
+
+    # Set server URL from args or config
+    if args.server:
+        SERVER_URL = args.server
+    elif cfg.get('server'):
+        SERVER_URL = cfg['server']
+
+    # Explicit --login: authenticate existing account on this device
+    if args.login:
+        import getpass
+        name = args.name or input("  Account name: ").strip()
+        if not args.server and not cfg.get('server'):
+            server = input("  Hive server [https://wathome.akataleptos.com]: ").strip()
+            SERVER_URL = server or "https://wathome.akataleptos.com"
+        pw = getpass.getpass("  Password: ")
+        try:
+            api_key, worker_id = login(name, pw)
+            print(f"  \033[92m✓\033[0m Logged in as {name}. Key saved.\n")
+        except Exception as e:
+            print(f"  \033[91mLogin failed: {e}\033[0m")
+            sys.exit(1)
+        cfg = load_config()  # Reload after login saved it
+
+    # Interactive first-run wizard if no config exists and no CLI args
+    setup_password = None
+    if not args.login and not cfg.get('api_key') and not args.key and not args.server and not args.name:
+        name, server, setup_password = interactive_setup(cfg)
+        args.name = name
+        SERVER_URL = server
+
+    # Set nice priority
+    try:
+        os.nice(args.nice)
+    except (OSError, AttributeError):
+        pass
+
+    display = Display()
+
+    # Get or create API key
+    api_key = args.key or cfg.get('api_key')
+
+    if not api_key:
+        display.show_info("No API key found. Registering with Hive...")
+        name = args.name or cfg.get('name', f"worker-{os.getpid()}")
+        # Get password if we don't have one from interactive setup
+        if not setup_password:
+            import getpass
+            setup_password = getpass.getpass("  Password: ")
+        try:
+            api_key, worker_id = register(name, GPU_INFO, password=setup_password)
+            display.show_info(f"Registered as {worker_id}. API key saved to {CONFIG_PATH}")
+        except NameTakenError:
+            # Name exists — try logging in instead
+            display.show_info(f"Name '{name}' already registered. Logging in...")
+            try:
+                api_key, worker_id = login(name, setup_password)
+                display.show_info(f"Logged in as {name}. New device key saved to {CONFIG_PATH}")
+            except Exception as e2:
+                display.show_error(f"Login failed: {e2}")
+                sys.exit(1)
+        except Exception as e:
+            display.show_error(f"Registration failed: {e}")
+            sys.exit(1)
+    else:
+        worker_id = cfg.get('worker_id', api_key[:8])
+        if args.name and args.name != cfg.get('name'):
+            cfg['name'] = args.name
+            save_config(cfg)
+            # Update name on server
+            try:
+                requests.post(
+                    f"{SERVER_URL}/worker/update",
+                    headers={"x-api-key": api_key},
+                    json={"name": args.name},
+                    timeout=10
+                )
+                display.show_info(f"Updated name to '{args.name}' on Hive")
+            except Exception:
+                pass  # non-critical
+
+    display.banner(worker_id, GPU_INFO)
+
+    # Screensaver mode
+    if args.screensaver:
+        try:
+            from screensaver import run_screensaver
+            run_screensaver(api_key, SERVER_URL, worker_id)
+        except ImportError:
+            display.show_error("screensaver.py not found — run without --screensaver")
+        return
+
+    # Start heartbeat thread
+    hb_thread = threading.Thread(target=heartbeat_loop, args=(api_key,), daemon=True)
+    hb_thread.start()
+
+    # Graceful shutdown
+    running = True
+    def handle_signal(sig, frame):
+        nonlocal running
+        display.show_info("\nGraceful shutdown... finishing current job.")
+        running = False
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+
+    # Check for interrupted job
+    ckpt = load_checkpoint()
+    if ckpt:
+        display.show_info(f"Found checkpoint for job {ckpt.get('job_id')} — will resume")
+
+    backoff = MIN_BACKOFF
+    jobs_since_update_check = 0
+
+    while running:
+        try:
+            # Check for client updates every 10 jobs
+            jobs_since_update_check += 1
+            if jobs_since_update_check >= 10:
+                jobs_since_update_check = 0
+                if check_for_update():
+                    display.show_info("Client updated! Restarting...")
+                    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+            # Pull job
+            resp = requests.post(
+                f"{SERVER_URL}/job",
+                headers={"x-api-key": api_key},
+                timeout=30
+            )
+
+            if resp.status_code == 401:
+                display.show_error("API key rejected. Re-register with --key or delete worker_config.json")
+                break
+
+            if resp.status_code != 200:
+                display.show_error(f"Server error: {resp.status_code}")
+                display.show_waiting(backoff)
+                time.sleep(backoff)
+                backoff = min(backoff * 2, MAX_BACKOFF)
+                continue
+
+            data = resp.json()
+
+            if data.get('status') == 'no_jobs':
+                display.show_info("All jobs assigned. Waiting for more...")
+                display.show_waiting(60)
+                time.sleep(60)
+                continue
+
+            backoff = MIN_BACKOFF  # Reset on success
+
+            job_id = data['job_id']
+            params = data['params']
+            params['job_id'] = job_id
+            progress = data.get('progress', {})
+
+            display.show_progress(progress)
+            display.show_job(job_id, params['lambda'], params)
+
+            # Compute
+            start_time = time.time()
+            eigs = run_job_with_stages(params, display, checkpoint=ckpt)
+            duration = time.time() - start_time
+            ckpt = None  # Clear checkpoint reference after use
+
+            # Check for constants
+            hits = check_for_gold(eigs)
+            display.show_result(hits, eigs, duration)
+
+            if hits:
+                display.worker_stats['discoveries'] += len(hits)
+
+            # Submit result
+            eig_hash = hash_eigenvalues(eigs.tolist())
+            resp = requests.post(
+                f"{SERVER_URL}/result",
+                headers={"x-api-key": api_key},
+                json={
+                    "job_id": job_id,
+                    "eigenvalues": eigs.tolist(),
+                    "eigenvalues_hash": eig_hash,
+                    "found_constants": hits,
+                    "compute_seconds": duration,
+                },
+                timeout=30
+            )
+
+            if resp.status_code == 200:
+                result = resp.json()
+                if result.get('verified'):
+                    display.show_info("Result verified by quorum!")
+                w_earned = result.get('w_minted', result.get('w_earned', 0))
+                if w_earned:
+                    print(f"  {Display.GOLD}+{w_earned:.4f} W earned{Display.RESET}")
+                    display.worker_stats.setdefault('w_total', 0)
+                    display.worker_stats['w_total'] += w_earned
+                    print(f"  {Display.DIM}Session W: {display.worker_stats['w_total']:.4f}{Display.RESET}")
+                if result.get('receipt'):
+                    save_receipt(result['receipt'])
+            else:
+                display.show_error(f"Submit failed: {resp.status_code} {resp.text}")
+
+        except KeyboardInterrupt:
+            break
+        except requests.ConnectionError:
+            display.show_error("Cannot reach Hive server")
+            display.show_waiting(backoff)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, MAX_BACKOFF)
+        except Exception as e:
+            display.show_error(f"Error: {e}")
+            display.show_waiting(backoff)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, MAX_BACKOFF)
+
+    display.show_info("Worker stopped. Progress saved. Run again to resume.")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        print(f"\n  \033[91mError: {e}\033[0m")
+        print("  If this keeps happening, check your internet connection")
+        print("  or contact the Hive admin.\n")
+        # Keep window open on crash so user can read the error
+        if getattr(sys, 'frozen', False):  # PyInstaller exe
+            input("  Press Enter to exit...")

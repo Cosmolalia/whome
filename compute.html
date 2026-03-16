@@ -73,14 +73,39 @@
   .steps-bar .dot.current { background: var(--cyan); box-shadow: 0 0 8px var(--cyan); }
 
   /* Inputs */
-  input[type="text"] {
+  input[type="text"], input[type="password"], input[type="email"] {
     width: 100%; background: var(--bg); border: 1px solid var(--border);
     border-radius: 6px; padding: 0.8em 1em; color: var(--text);
     font-family: inherit; font-size: 1em; outline: none;
     transition: border-color 0.2s;
   }
-  input[type="text"]:focus { border-color: var(--cyan); }
-  input[type="text"]::placeholder { color: var(--dim); }
+  input[type="text"]:focus, input[type="password"]:focus, input[type="email"]:focus { border-color: var(--cyan); }
+  input[type="text"]::placeholder, input[type="password"]::placeholder, input[type="email"]::placeholder { color: var(--dim); }
+
+  .input-group { margin-bottom: 1em; }
+  .input-group label { display: block; font-size: 0.85em; color: var(--dim); margin-bottom: 0.3em; }
+
+  .auth-tabs {
+    display: flex; margin-bottom: 1.5em; border-radius: 6px;
+    overflow: hidden; border: 1px solid var(--border);
+  }
+  .auth-tabs button {
+    flex: 1; padding: 0.6em; background: transparent; color: var(--dim);
+    border: none; font-family: inherit; font-size: 0.9em; cursor: pointer;
+    transition: all 0.2s;
+  }
+  .auth-tabs button.active { background: var(--cyan); color: var(--bg); font-weight: bold; }
+
+  .auth-error {
+    color: var(--red); font-size: 0.85em; margin-top: 0.5em;
+    display: none; min-height: 1.2em;
+  }
+  .auth-error.show { display: block; }
+
+  .verify-code {
+    text-align: center; font-size: 1.8em; letter-spacing: 0.4em;
+    padding: 0.5em !important;
+  }
 
   /* Sliders */
   .slider-group { margin: 1.5em 0; }
@@ -301,6 +326,7 @@ window.onerror = function(msg, url, line, col, err) {
     <div class="dot current" id="dot-0"></div>
     <div class="dot" id="dot-1"></div>
     <div class="dot" id="dot-2"></div>
+    <div class="dot" id="dot-3"></div>
   </div>
 
   <!-- Step 0: Welcome -->
@@ -327,23 +353,54 @@ window.onerror = function(msg, url, line, col, err) {
     </div>
   </div>
 
-  <!-- Step 1: Identity -->
+  <!-- Step 1: Account -->
   <div class="step" id="step-1">
-    <h1>Name Your Node</h1>
-    <h2>How should we credit your contribution?</h2>
-    <input type="text" id="worker-name" placeholder="e.g. quantum-marmelade"
-           maxlength="40" autocomplete="off" spellcheck="false">
-    <p style="margin-top: 1em;">
-      This appears on the public leaderboard. You can change it later.
-    </p>
+    <h1>Your Account</h1>
+    <div class="auth-tabs">
+      <button class="active" id="tab-register" onclick="setAuthMode('register')">New Account</button>
+      <button id="tab-login" onclick="setAuthMode('login')">I Have One</button>
+    </div>
+
+    <div class="input-group">
+      <label>Name (appears on leaderboard)</label>
+      <input type="text" id="worker-name" placeholder="e.g. quantum-marmalade"
+             maxlength="40" autocomplete="off" spellcheck="false">
+    </div>
+    <div class="input-group">
+      <label>Password</label>
+      <input type="password" id="worker-password" placeholder="6+ characters" autocomplete="new-password">
+    </div>
+    <div class="input-group" id="email-group">
+      <label>Email (for verification)</label>
+      <input type="email" id="worker-email" placeholder="you@example.com" autocomplete="email">
+    </div>
+
+    <div class="auth-error" id="auth-error"></div>
+
     <div class="btn-row">
       <button class="btn btn-secondary" onclick="prevStep()">Back</button>
-      <button class="btn btn-primary" onclick="nextStep()">Next</button>
+      <button class="btn btn-primary" id="auth-btn" onclick="doAuth()">Create Account</button>
     </div>
   </div>
 
-  <!-- Step 2: Configure -->
+  <!-- Step 2: Email Verification -->
   <div class="step" id="step-2">
+    <h1>Verify Email</h1>
+    <h2>Check your inbox</h2>
+    <p>We sent a 6-digit code to <strong id="verify-email-display"></strong></p>
+    <div class="input-group">
+      <input type="text" id="verify-code" class="verify-code" placeholder="000000"
+             maxlength="6" inputmode="numeric" autocomplete="one-time-code">
+    </div>
+    <div class="auth-error" id="verify-error"></div>
+    <div class="btn-row">
+      <button class="btn btn-secondary" id="resend-btn" onclick="resendCode()">Resend Code</button>
+      <button class="btn btn-primary" onclick="doVerify()">Verify</button>
+    </div>
+  </div>
+
+  <!-- Step 3: Configure -->
+  <div class="step" id="step-3">
     <h1>Configure</h1>
     <h2>How hard should we work?</h2>
 
@@ -513,30 +570,46 @@ let workerId = null;
 let paused = false;
 let jobsDone = 0;
 let worker = null;
+let authMode = 'register'; // 'register' or 'login'
 
 // ── Wizard Navigation ──
 
-function nextStep() {
-  if (currentStep === 1) {
-    const name = document.getElementById('worker-name').value.trim();
-    if (!name) { document.getElementById('worker-name').focus(); return; }
-    config.name = name;
-  }
+function goToStep(n) {
   document.getElementById('step-' + currentStep).classList.remove('active');
   document.getElementById('dot-' + currentStep).classList.remove('current');
-  document.getElementById('dot-' + currentStep).classList.add('done');
-  currentStep++;
-  document.getElementById('step-' + currentStep).classList.add('active');
-  document.getElementById('dot-' + currentStep).classList.add('current');
+  if (n > currentStep) {
+    for (let i = currentStep; i < n; i++)
+      document.getElementById('dot-' + i).classList.add('done');
+  } else {
+    for (let i = n; i <= currentStep; i++)
+      document.getElementById('dot-' + i).classList.remove('done');
+  }
+  currentStep = n;
+  document.getElementById('step-' + n).classList.add('active');
+  document.getElementById('dot-' + n).classList.add('current');
+}
+
+function nextStep() {
+  goToStep(currentStep + 1);
 }
 
 function prevStep() {
-  document.getElementById('step-' + currentStep).classList.remove('active');
-  document.getElementById('dot-' + currentStep).classList.remove('current');
-  currentStep--;
-  document.getElementById('step-' + currentStep).classList.add('active');
-  document.getElementById('dot-' + currentStep).classList.add('current');
-  document.getElementById('dot-' + currentStep).classList.remove('done');
+  goToStep(currentStep - 1);
+}
+
+function setAuthMode(mode) {
+  authMode = mode;
+  document.getElementById('tab-register').classList.toggle('active', mode === 'register');
+  document.getElementById('tab-login').classList.toggle('active', mode === 'login');
+  document.getElementById('email-group').style.display = mode === 'register' ? 'block' : 'none';
+  document.getElementById('auth-btn').textContent = mode === 'register' ? 'Create Account' : 'Log In';
+  document.getElementById('auth-error').classList.remove('show');
+}
+
+function showAuthError(msg) {
+  const el = document.getElementById('auth-error');
+  el.textContent = msg;
+  el.classList.add('show');
 }
 
 function updateIntensity(v) {
@@ -568,19 +641,134 @@ function loadLocal() {
   return false;
 }
 
-// ── Registration ──
+// ── Authentication (register or login) ──
 
-async function registerWorker() {
-  const resp = await fetch(API + '/register', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({ name: config.name, gpu_info: 'WebAssembly (Browser)' })
-  });
-  const data = await resp.json();
-  apiKey = data.api_key;
-  workerId = data.worker_id;
-  saveLocal();
-  return data;
+async function doAuth() {
+  const name = document.getElementById('worker-name').value.trim();
+  const password = document.getElementById('worker-password').value;
+  const email = document.getElementById('worker-email') ? document.getElementById('worker-email').value.trim() : '';
+
+  if (!name) { showAuthError('Name is required'); return; }
+  if (password.length < 6) { showAuthError('Password must be at least 6 characters'); return; }
+  if (authMode === 'register' && !email) { showAuthError('Email is required for verification'); return; }
+  if (authMode === 'register' && !email.includes('@')) { showAuthError('Please enter a valid email'); return; }
+
+  const btn = document.getElementById('auth-btn');
+  const origText = btn.textContent;
+  btn.disabled = true;
+  btn.innerHTML = '<span class="loader"></span>' + (authMode === 'register' ? 'Creating...' : 'Logging in...');
+  document.getElementById('auth-error').classList.remove('show');
+
+  try {
+    if (authMode === 'register') {
+      // Try register
+      const resp = await fetch(API + '/register', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          name: name,
+          password: password,
+          email: email,
+          gpu_info: 'WebAssembly (Browser)',
+          device_name: 'browser-' + navigator.userAgent.slice(0, 20),
+        })
+      });
+      const data = await resp.json();
+      if (!resp.ok) {
+        showAuthError(data.detail || 'Registration failed');
+        btn.disabled = false; btn.textContent = origText;
+        return;
+      }
+      apiKey = data.api_key;
+      workerId = data.worker_id;
+      config.name = name;
+      saveLocal();
+
+      // Show email verification step
+      document.getElementById('verify-email-display').textContent = email;
+      if (data._debug_code) {
+        // SMTP not configured — show code for testing
+        document.getElementById('verify-code').value = data._debug_code;
+      }
+      goToStep(2);
+    } else {
+      // Login
+      const resp = await fetch(API + '/login', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({
+          name: name,
+          password: password,
+          gpu_info: 'WebAssembly (Browser)',
+          device_name: 'browser-' + navigator.userAgent.slice(0, 20),
+        })
+      });
+      const data = await resp.json();
+      if (!resp.ok) {
+        showAuthError(data.detail || 'Login failed');
+        btn.disabled = false; btn.textContent = origText;
+        return;
+      }
+      apiKey = data.api_key;
+      workerId = data.worker_id;
+      config.name = name;
+      saveLocal();
+      // Skip verification, go straight to configure
+      goToStep(3);
+    }
+  } catch(e) {
+    showAuthError('Network error: ' + e.message);
+  }
+  btn.disabled = false;
+  btn.textContent = origText;
+}
+
+async function doVerify() {
+  const code = document.getElementById('verify-code').value.trim();
+  if (code.length !== 6) {
+    document.getElementById('verify-error').textContent = 'Enter the 6-digit code';
+    document.getElementById('verify-error').classList.add('show');
+    return;
+  }
+  try {
+    const resp = await fetch(API + '/verify-email', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json', 'x-api-key': apiKey},
+      body: JSON.stringify({ code: code })
+    });
+    const data = await resp.json();
+    if (!resp.ok) {
+      document.getElementById('verify-error').textContent = data.detail || 'Verification failed';
+      document.getElementById('verify-error').classList.add('show');
+      return;
+    }
+    document.getElementById('verify-error').classList.remove('show');
+    goToStep(3);
+  } catch(e) {
+    document.getElementById('verify-error').textContent = 'Network error';
+    document.getElementById('verify-error').classList.add('show');
+  }
+}
+
+async function resendCode() {
+  const btn = document.getElementById('resend-btn');
+  btn.disabled = true;
+  btn.textContent = 'Sending...';
+  try {
+    const resp = await fetch(API + '/resend-verification', {
+      method: 'POST',
+      headers: {'x-api-key': apiKey}
+    });
+    const data = await resp.json();
+    if (data._debug_code) {
+      document.getElementById('verify-code').value = data._debug_code;
+    }
+    btn.textContent = 'Sent!';
+    setTimeout(() => { btn.disabled = false; btn.textContent = 'Resend Code'; }, 3000);
+  } catch(e) {
+    btn.textContent = 'Failed';
+    setTimeout(() => { btn.disabled = false; btn.textContent = 'Resend Code'; }, 3000);
+  }
 }
 
 // ── Compute ──
@@ -618,10 +806,11 @@ async function startCompute() {
   btn.innerHTML = '<span class="loader"></span>Initializing...';
   btn.disabled = true;
 
-  // Check for existing session
-  if (!loadLocal()) {
-    await registerWorker();
-  }
+  // Config from step 3 toggles
+  config.charging = document.getElementById('toggle-charging').classList.contains('on');
+  config.battery = document.getElementById('toggle-battery').classList.contains('on');
+  config.background = document.getElementById('toggle-background').classList.contains('on');
+  saveLocal();
 
   // Switch to compute view with loading overlay
   document.getElementById('wizard-view').style.display = 'none';
@@ -636,26 +825,25 @@ async function startCompute() {
   document.getElementById('bg-canvas').style.display = 'none';
 
   try {
-    // Step 1: Load Pyodide script from local server (no CDN dependency)
+    // Step 1: Load Pyodide from CDN (cached globally, ~10 MB)
     loadProgress(10, 'Loading Python runtime...', '');
-    const PYODIDE_URL = API + '/pyodide/';
+    const PYODIDE_CDN = 'https://cdn.jsdelivr.net/pyodide/v0.27.5/full/';
     const script = document.createElement('script');
-    script.src = PYODIDE_URL + 'pyodide.js';
+    script.src = PYODIDE_CDN + 'pyodide.js';
     document.head.appendChild(script);
     await new Promise((resolve, reject) => {
       script.onload = resolve;
       script.onerror = reject;
     });
 
-    // Step 2: Initialize Pyodide (point to our local server for all files)
+    // Step 2: Initialize Pyodide
     loadProgress(30, 'Initializing Python...', '~10 MB');
     log('Loading Python runtime...', 'info');
     const pyodide = await loadPyodide({
-      indexURL: PYODIDE_URL,
-      lockFileURL: PYODIDE_URL + 'pyodide-lock.json',
+      indexURL: PYODIDE_CDN,
     });
 
-    // Step 3: Install numpy + scipy from local server (~60MB total)
+    // Step 3: Install numpy + scipy from CDN (~60MB total, cached after first load)
     loadProgress(50, 'Downloading numpy + scipy...', '~60 MB — only once, then cached');
     log('Downloading math libraries (~60 MB)...', 'info');
     // Add shimmer animation during long download
@@ -678,12 +866,19 @@ async function startCompute() {
     const dlTime = ((Date.now() - loadStart) / 1000).toFixed(0);
     log('Libraries loaded in ' + dlTime + 's (cached for next time)', 'ok');
 
-    // Step 4: Load compute kernel
+    // Step 4: Load compute kernel (inlined by server — no fetch needed)
     loadProgress(90, 'Loading compute kernel...', '');
-    log('Runtime ready. Fetching compute kernel...', 'ok');
-    const wopResp = await fetch(API + '/static/w_operator.py');
-    const wopCode = await wopResp.text();
-    pyodide.runPython(wopCode);
+    log('Runtime ready. Loading compute kernel...', 'ok');
+    const wopCode = "__COMPUTE_KERNEL_PLACEHOLDER__";
+    // Register as a proper Python module so "import w_operator" works in the compute loop
+    // Module must be in sys.modules BEFORE exec — @dataclass looks up cls.__module__ during definition
+    pyodide.runPython(`
+import sys, types
+_wop = types.ModuleType('w_operator')
+sys.modules['w_operator'] = _wop
+exec(${JSON.stringify(wopCode)}, _wop.__dict__)
+del _wop
+`);
 
     // Done loading
     loadProgress(100, 'Ready!', '');
@@ -734,7 +929,7 @@ async function computeLoop(pyodide) {
       // Pull job
       const jobResp = await fetch(API + '/job', {
         method: 'POST',
-        headers: {'x-api-key': apiKey}
+        headers: {'x-api-key': apiKey, 'x-device-type': 'mobile'}
       });
       const jobData = await jobResp.json();
 
@@ -823,8 +1018,11 @@ for i in range(cap):
             if abs(ratio - val) / val < 1e-4:
                 hits.append(f"{name} (ratio={ratio:.6f})")
 
+eig_hash = wop.hash_eigenvalues(eigs)
+
 json.dumps({
-    "eigenvalues": [round(float(x), 12) for x in sorted(eigs)],
+    "eigenvalues": [round(float(x), 10) for x in sorted(eigs)],
+    "eigenvalues_hash": eig_hash,
     "hits": hits,
     "n_vertices": len(vertices),
 })
@@ -836,11 +1034,8 @@ json.dumps({
 
       log('  Complete: ' + resultData.n_vertices + ' vertices, ' + elapsed + 's', 'ok');
 
-      // Hash eigenvalues
-      const sorted_eigs = resultData.eigenvalues.sort((a,b) => a-b);
-      const hashPayload = JSON.stringify(sorted_eigs.map(e => parseFloat(e.toFixed(12))));
-      const hashBuffer = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(hashPayload));
-      const eigHash = Array.from(new Uint8Array(hashBuffer)).map(b => b.toString(16).padStart(2,'0')).join('');
+      // Hash computed in Python via w_operator.hash_eigenvalues (canonical 10-decimal rounding)
+      const eigHash = resultData.eigenvalues_hash;
 
       // Report hits
       if (resultData.hits.length > 0) {

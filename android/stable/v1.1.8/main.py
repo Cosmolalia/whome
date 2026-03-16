@@ -119,8 +119,8 @@ def solve_spectrum_fallback(L_sparse, M=40, tol=1e-8):
     n = L_sparse.shape[0]
     k = min(M + 1, n)
 
-    if n <= 1000:
-        # Small enough for dense solve (1000^2 * 16 = 16 MB)
+    if n <= 2000:
+        # Small enough for dense solve
         if hasattr(L_sparse, 'toarray'):
             dense = L_sparse.toarray()
         else:
@@ -183,42 +183,31 @@ def _lanczos_smallest(A, k, tol=1e-8, max_iter=300):
 
 # Monkey-patch w_operator to use our fallback if scipy is missing
 if not HAS_SCIPY:
-    class DictSparse:
-        """Sparse matrix using dict-of-keys. Only stores nonzero entries."""
-        def __init__(self, n):
-            self.shape = (n, n)
-            self.rows = {}
-        def add(self, i, j, val):
-            if i not in self.rows:
-                self.rows[i] = {}
-            self.rows[i][j] = self.rows[i].get(j, 0) + val
-        def dot(self, v):
-            n = self.shape[0]
-            result = np.zeros(n, dtype=np.complex128)
-            for i, cols in self.rows.items():
-                s = 0j
-                for j, val in cols.items():
-                    s += val * v[j]
-                result[i] = s
-            return result
-        def toarray(self):
-            n = self.shape[0]
-            dense = np.zeros((n, n), dtype=np.complex128)
-            for i, cols in self.rows.items():
-                for j, val in cols.items():
-                    dense[i, j] = val
-            return dense
+    # Build a minimal sparse matrix class using numpy
+    class SimpleSparse:
+        """Minimal COO/CSR-like sparse matrix backed by dense numpy."""
+        def __init__(self, dense):
+            self.data = np.array(dense, dtype=np.complex128)
+            self.shape = self.data.shape
 
+        def dot(self, v):
+            return self.data.dot(v)
+
+        def toarray(self):
+            return self.data
+
+    # Override w_operator's build_magnetic_laplacian to return dense
     _orig_build_mag_lap = w_operator.build_magnetic_laplacian
 
     def _patched_build_magnetic_laplacian(vertices, edges, s, psi_by_id):
+        """Build Laplacian as dense matrix when scipy.sparse is unavailable."""
         v_ids = sorted(vertices.keys())
         id_to_idx = {vid: i for i, vid in enumerate(v_ids)}
         n = len(v_ids)
         TAU = 2 * 3.141592653589793
 
         deg = np.zeros(n, dtype=np.float64)
-        L = DictSparse(n)
+        L = np.zeros((n, n), dtype=np.complex128)
 
         for (u, v), rec in edges.items():
             w = float(rec["w"])
@@ -245,13 +234,13 @@ if not HAS_SCIPY:
             val_uv = w * cmath.exp(1j * a_u_to_v)
             val_vu = val_uv.conjugate()
 
-            L.add(iu, iv, -val_uv)
-            L.add(iv, iu, -val_vu)
+            L[iu, iv] -= val_uv
+            L[iv, iu] -= val_vu
 
         for i in range(n):
-            L.add(i, i, deg[i])
+            L[i, i] = deg[i]
 
-        return L, id_to_idx
+        return SimpleSparse(L), id_to_idx
 
     w_operator.build_magnetic_laplacian = _patched_build_magnetic_laplacian
     w_operator.solve_spectrum = solve_spectrum_fallback
@@ -261,7 +250,7 @@ if not HAS_SCIPY:
 # Constants & config
 # ═══════════════════════════════════════════════════════════
 
-VERSION = "2.2.0"
+VERSION = "1.0.1"
 DEFAULT_SERVER = "https://wathome.akataleptos.com"
 
 CONSTANTS = {

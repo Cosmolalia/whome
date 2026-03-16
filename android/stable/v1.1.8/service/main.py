@@ -77,7 +77,7 @@ except ImportError:
 def solve_spectrum_fallback(L_sparse, M=40, tol=1e-8):
     n = L_sparse.shape[0]
     k = min(M + 1, n)
-    if n <= 1000:
+    if n <= 2000:
         if hasattr(L_sparse, 'toarray'):
             dense = L_sparse.toarray()
         else:
@@ -125,30 +125,14 @@ def _lanczos_smallest(A, k, tol=1e-8, max_iter=300):
 
 # Monkey-patch w_operator if scipy missing
 if not HAS_SCIPY:
-    class DictSparse:
-        def __init__(self, n):
-            self.shape = (n, n)
-            self.rows = {}
-        def add(self, i, j, val):
-            if i not in self.rows:
-                self.rows[i] = {}
-            self.rows[i][j] = self.rows[i].get(j, 0) + val
+    class SimpleSparse:
+        def __init__(self, dense):
+            self.data = np.array(dense, dtype=np.complex128)
+            self.shape = self.data.shape
         def dot(self, v):
-            n = self.shape[0]
-            result = np.zeros(n, dtype=np.complex128)
-            for i, cols in self.rows.items():
-                s = 0j
-                for j, val in cols.items():
-                    s += val * v[j]
-                result[i] = s
-            return result
+            return self.data.dot(v)
         def toarray(self):
-            n = self.shape[0]
-            dense = np.zeros((n, n), dtype=np.complex128)
-            for i, cols in self.rows.items():
-                for j, val in cols.items():
-                    dense[i, j] = val
-            return dense
+            return self.data
 
     _orig_build = w_operator.build_magnetic_laplacian
 
@@ -158,7 +142,7 @@ if not HAS_SCIPY:
         n = len(v_ids)
         TAU = 2 * 3.141592653589793
         deg = np.zeros(n, dtype=np.float64)
-        L = DictSparse(n)
+        L = np.zeros((n, n), dtype=np.complex128)
         for (u, v), rec in edges.items():
             w = float(rec["w"])
             iu = id_to_idx[u]
@@ -181,11 +165,11 @@ if not HAS_SCIPY:
             import cmath
             val_uv = w * cmath.exp(1j * a_u_to_v)
             val_vu = val_uv.conjugate()
-            L.add(iu, iv, -val_uv)
-            L.add(iv, iu, -val_vu)
+            L[iu, iv] -= val_uv
+            L[iv, iu] -= val_vu
         for i in range(n):
-            L.add(i, i, deg[i])
-        return L, id_to_idx
+            L[i, i] = deg[i]
+        return SimpleSparse(L), id_to_idx
 
     w_operator.build_magnetic_laplacian = _patched_build
     w_operator.solve_spectrum = solve_spectrum_fallback

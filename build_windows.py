@@ -60,6 +60,7 @@ def build_exe():
         '--name=WHome',
         '--add-data', f'w_operator.py{os.pathsep}.',
         '--add-data', f'w_cuda.py{os.pathsep}.',
+        '--add-data', f'fractal_falsify.py{os.pathsep}.',
         '--add-data', f'screensaver.py{os.pathsep}.',
     ]
 
@@ -115,7 +116,7 @@ def build_exe():
     print(f"  [OK] Copied: {scr_path}")
 
     # Copy supporting files to dist/ for Inno Setup
-    for f in ['w_operator.py', 'w_cuda.py', 'screensaver.py', 'icon-192.png']:
+    for f in ['w_operator.py', 'w_cuda.py', 'fractal_falsify.py', 'screensaver.py', 'icon-192.png']:
         src = os.path.join(APP_DIR, f)
         if os.path.exists(src):
             shutil.copy2(src, DIST_DIR)

@@ -156,7 +156,7 @@ say "  ${CYAN}Downloading W@Home...${RESET}"
 HIVE_SERVER="${HIVE_SERVER:-https://wathome.akataleptos.com}"
 
 # Try downloading from server, fall back to local copy
-for f in whome_gui.py client.py w_operator.py w_cuda.py screensaver.py icon-menger-256.png; do
+for f in whome_gui.py client.py w_operator.py w_cuda.py fractal_falsify.py screensaver.py icon-menger-256.png; do
     if curl -sSf "$HIVE_SERVER/static/$f" -o "$INSTALL_DIR/$f" 2>/dev/null; then
         say "  ${GREEN}✓${RESET} $f"
     elif [ -f "$(dirname "$0")/$f" ]; then

@@ -1,5 +1,5 @@
 // W@Home Service Worker — Cache Pyodide + packages for instant subsequent loads
-const CACHE_NAME = 'whome-v2';
+const CACHE_NAME = 'whome-v3';
 
 // Core app files to precache
 const PRECACHE = [
@@ -10,7 +10,7 @@ const PRECACHE = [
 
 // Patterns for immutable resources (cache-first: serve from cache, never re-download)
 const IMMUTABLE_PATTERNS = [
-  '/pyodide/',                              // locally-hosted Pyodide + numpy + scipy
+  'cdn.jsdelivr.net/pyodide/',               // Pyodide CDN (Python runtime + numpy + scipy)
   'cdnjs.cloudflare.com/ajax/libs/three.js', // Three.js CDN (background animation)
 ];
 
@@ -39,6 +39,7 @@ self.addEventListener('fetch', event => {
   // Don't cache API calls (POST requests, dynamic endpoints)
   if (event.request.method !== 'GET') return;
   if (url.includes('/job') || url.includes('/result') || url.includes('/register') ||
+      url.includes('/login') || url.includes('/verify') || url.includes('/resend') ||
       url.includes('/heartbeat') || url.includes('/progress') || url.includes('/workers') ||
       url.includes('/leaderboard') || url.includes('/active') || url.includes('/worker/update') ||
       url.includes('/dashboard') || url.includes('/discoveries')) {

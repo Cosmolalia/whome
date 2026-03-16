@@ -16,7 +16,7 @@ source.dir = .
 source.include_exts = py,png,jpg,kv,atlas,json
 
 # (str) Application versioning
-version = 2.3.0
+version = 1.1.8
 
 # (list) Application requirements
 # scipy removed — requires legacy NDK r21e with gfortran for LAPACK cross-compilation.

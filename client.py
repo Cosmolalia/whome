@@ -75,6 +75,12 @@ except ImportError:
     print("[!] Cannot import w_operator — make sure w_operator.py is in the same directory")
     sys.exit(1)
 
+try:
+    from fractal_falsify import run_work_unit as falsify_work_unit
+    HAS_FALSIFY = True
+except ImportError:
+    HAS_FALSIFY = False
+
 # ═══════════════════════════════════════════════════════════
 # Config persistence
 # ═══════════════════════════════════════════════════════════
@@ -304,6 +310,17 @@ class Display:
 # ═══════════════════════════════════════════════════════════
 
 def run_job_with_stages(params, display, checkpoint=None):
+    """Route by job_type, then run appropriate computation."""
+    job_type = params.get('job_type', 'eigenvalue')
+    if job_type == 'falsification':
+        return run_falsification(params, display)
+    elif job_type == 'boundary':
+        return run_boundary(params, display)
+    else:
+        return run_eigenvalue(params, display, checkpoint)
+
+
+def run_eigenvalue(params, display, checkpoint=None):
     """Run eigenvalue computation with per-stage progress and checkpointing."""
     k = params['k']
     G1, G2 = params['G1'], params['G2']
@@ -312,30 +329,70 @@ def run_job_with_stages(params, display, checkpoint=None):
     w_glue = params['w_glue']
     N = 2
 
-    # Stage 1: Build Graph
-    if checkpoint and checkpoint.get('stage', 0) >= 1:
-        display.show_stage("Build Graph", "(cached)")
-        # Can't cache graph easily (too large), rebuild
     display.show_stage("Build Graph", f"k={k} boundary cubes")
     vertices, edges, b_ids = base_op.build_graph(k, G1, G2, S, N)
     save_checkpoint({'job_id': params.get('job_id'), 'stage': 1, 'params': params})
 
-    # Stage 2: Add Glue
-    display.show_stage("Add Glue", f"λ={lam:.6f} w={w_glue}")
+    display.show_stage("Add Glue", f"\u03bb={lam:.6f} w={w_glue}")
     upd, psi_by = base_op.add_glue_edges(vertices, b_ids, lam, w_glue, G1, G2)
     save_checkpoint({'job_id': params.get('job_id'), 'stage': 2, 'params': params})
 
-    # Stage 3: Merge Edges
     display.show_stage("Merge Edges", f"{len(edges):,} + {len(upd):,} glue")
     edges_merged = base_op.merge_edges(edges, upd)
 
-    # Stage 4: Build Laplacian
     display.show_stage("Build Laplacian", f"{len(vertices):,} vertices")
     L, _ = base_op.build_magnetic_laplacian(vertices, edges_merged, s=(0, 0), psi_by_id=psi_by)
     save_checkpoint({'job_id': params.get('job_id'), 'stage': 4, 'params': params})
 
-    # Stage 5: Solve Spectrum
     display.show_stage("Solve Spectrum", "eigsh M=40")
+    if HAS_GPU:
+        eigs = w_cuda.solve_spectrum_gpu(L, M=40)
+    else:
+        eigs = base_op.solve_spectrum(L, M=40)
+
+    clear_checkpoint()
+    return eigs
+
+
+def run_falsification(params, display):
+    """Run falsification job — test random 3D fractals against Menger predictions."""
+    seed = int(params.get('seed', params.get('lambda', 0)))
+    display.show_stage("Falsification", f"seed={seed}")
+    if HAS_FALSIFY:
+        result = falsify_work_unit(seed, b=3, level=1)
+        if isinstance(result, dict) and 'eigenvalues' in result:
+            return np.array(result['eigenvalues'], dtype=np.float64)
+        return np.array([0.0], dtype=np.float64)
+    return np.array([0.0], dtype=np.float64)
+
+
+def run_boundary(params, display):
+    """Run Howard Sphere boundary-only eigenvalue computation."""
+    k = params['k']
+    G1, G2 = params['G1'], params['G2']
+    S = params['S']
+    lam = params['lambda']
+    w_glue = params['w_glue']
+
+    display.show_stage("Build Graph (Boundary)", f"k={k}")
+    vertices, edges, b_ids = base_op.build_graph(k, G1, G2, S, 2)
+
+    display.show_stage("Boundary Edges", f"\u03bb={lam:.6f}")
+    upd, psi_by = base_op.add_glue_edges(vertices, b_ids, lam, w_glue, G1, G2)
+    edges_merged = base_op.merge_edges(edges, upd)
+
+    boundary_set = set(b_ids)
+    boundary_edges = {(u, v): rec for (u, v), rec in edges_merged.items()
+                      if u in boundary_set and v in boundary_set}
+    if not boundary_edges:
+        return np.array([0.0], dtype=np.float64)
+
+    display.show_stage("Boundary Laplacian", f"{len(boundary_set)} verts")
+    L, _ = base_op.build_magnetic_laplacian(
+        {v: vertices[v] for v in boundary_set}, boundary_edges,
+        s=(0, 0), psi_by_id=psi_by)
+
+    display.show_stage("Solve Boundary Spectrum", "eigsh M=40")
     if HAS_GPU:
         eigs = w_cuda.solve_spectrum_gpu(L, M=40)
     else:
@@ -669,6 +726,12 @@ def main():
                 result = resp.json()
                 if result.get('verified'):
                     display.show_info("Result verified by quorum!")
+                w_earned = result.get('w_minted', result.get('w_earned', 0))
+                if w_earned:
+                    print(f"  {Display.GOLD}+{w_earned:.4f} W earned{Display.RESET}")
+                    display.worker_stats.setdefault('w_total', 0)
+                    display.worker_stats['w_total'] += w_earned
+                    print(f"  {Display.DIM}Session W: {display.worker_stats['w_total']:.4f}{Display.RESET}")
                 if result.get('receipt'):
                     save_receipt(result['receipt'])
             else:
