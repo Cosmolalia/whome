@@ -17,3 +17,5 @@ receipts.jsonl
 android/.buildozer/
 android/bin/
 android/build.log
+*.jks
+*.log
